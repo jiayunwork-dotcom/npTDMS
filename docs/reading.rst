@@ -213,6 +213,32 @@ When you've opened a TDMS file with :py:meth:`~nptdms.TdmsFile.open`, you instea
 
 This will return an array of raw data, or a dictionary of scaler id to raw scaler data for DAQmx data.
 
+Online reading of growing files
+-------------------------------
+
+When an acquisition process is still writing to a TDMS file, you can follow it with
+:py:meth:`nptdms.TdmsFile.open_online`, which returns an :py:class:`~nptdms.online.OnlineTdmsFile`.
+Calling :py:meth:`~nptdms.online.OnlineTdmsFile.refresh` delivers a new
+:py:class:`~nptdms.TdmsFile` view of the segments that were completely written in the main
+data file at that point::
+
+    with TdmsFile.open_online("my_file.tdms") as online_file:
+        tdms_file = online_file.refresh()
+        # ... acquisition appends more segments ...
+        with online_file.refresh() as new_view:
+            # new_view sees the newly completed segments,
+            # tdms_file still sees only its own segments
+            ...
+
+A segment becomes visible once its lead-in, metadata and raw data are all present in the
+main file and the lead-in declares a finite end position; a partially written segment is
+left for the next refresh. Any ``.tdms_index`` file is ignored, so segments are always
+determined by the main data file. Each view holds its own metadata and file handle, so
+views returned by earlier refreshes keep reading their own published segments and can be
+closed independently. If the file is replaced, truncated, or contains a corrupt segment
+within the published region, :py:meth:`~nptdms.online.OnlineTdmsFile.refresh` raises
+:py:class:`~nptdms.online.OnlineTdmsError` and previously delivered views are unaffected.
+
 Conversion to other formats
 ---------------------------
 

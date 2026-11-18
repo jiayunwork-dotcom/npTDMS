@@ -10,6 +10,12 @@ Reading TDMS Files
   :members:
   :exclude-members: object, objects, group_channels, channel_data
 
+.. autoclass:: nptdms.online.OnlineTdmsFile()
+  :members:
+
+.. autoclass:: nptdms.online.OnlineTdmsError()
+  :members:
+
 .. autoclass:: TdmsGroup()
   :members:
   :exclude-members: group, channel, has_data, property

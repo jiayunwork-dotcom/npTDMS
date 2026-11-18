@@ -8,4 +8,5 @@ from .version import __version_info__, __version__
 
 # Export public objects
 from .tdms import TdmsFile, TdmsGroup, TdmsChannel, DataChunk, GroupDataChunk, ChannelDataChunk
+from .online import OnlineTdmsFile, OnlineTdmsError
 from .writer import TdmsWriter, RootObject, GroupObject, ChannelObject

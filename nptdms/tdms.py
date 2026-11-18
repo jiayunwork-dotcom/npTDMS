@@ -92,6 +92,35 @@ class TdmsFile(object):
             file, raw_timestamps=raw_timestamps, memmap_dir=memmap_dir, read_metadata_only=True, keep_open=True)
 
     @staticmethod
+    def open_online(file, raw_timestamps=False, memmap_dir=None):
+        """ Opens a TDMS file for online reading while it is still being written
+
+        Unlike TdmsFile.open, which reads a complete file, this returns an
+        OnlineTdmsFile that tracks a file an acquisition process is appending
+        to. Call refresh on it to get a TdmsFile view of the segments that are
+        completely written at that point::
+
+            with TdmsFile.open_online(tdms_file_path) as online_file:
+                tdms_file = online_file.refresh()
+                # Use tdms_file, then refresh again for newer segments
+                ...
+
+        :param file: The path to the tdms file to read as a string or
+            pathlib.Path. The file must exist but may be empty.
+        :param raw_timestamps: By default TDMS timestamps are read as numpy datetime64
+            but this loses some precision.
+            Setting this to true will read timestamps as a custom TdmsTimestamp type.
+        :param memmap_dir: The directory to store memory mapped data files in,
+            or None to read data into memory. The data files are created
+            as temporary files and are deleted when the channel data is no
+            longer used. tempfile.gettempdir() can be used to get the default
+            temporary file directory.
+        :rtype: OnlineTdmsFile
+        """
+        from nptdms.online import OnlineTdmsFile
+        return OnlineTdmsFile(file, raw_timestamps=raw_timestamps, memmap_dir=memmap_dir)
+
+    @staticmethod
     def read_metadata(file, raw_timestamps=False):
         """ Creates a new TdmsFile object and only reads the metadata
 
@@ -102,6 +131,25 @@ class TdmsFile(object):
             Setting this to true will read timestamps as a custom TdmsTimestamp type.
         """
         return TdmsFile(file, raw_timestamps=raw_timestamps, read_metadata_only=True)
+
+    @classmethod
+    def _from_reader(cls, reader, raw_timestamps=False, memmap_dir=None):
+        """ Build a TdmsFile over a reader that already has its metadata
+
+            Used by online reading, where each refresh produces a reader that
+            has already discovered the segments published for that view.
+        """
+        tdms_file = cls.__new__(cls)
+        tdms_file._memmap_dir = memmap_dir
+        tdms_file._raw_timestamps = raw_timestamps
+        tdms_file._groups = OrderedDict()
+        tdms_file._properties = OrderedDict()
+        tdms_file._channel_data = {}
+        tdms_file._tdms_version = 0
+        tdms_file.data_read = False
+        tdms_file._reader = reader
+        tdms_file._read_file(reader, read_metadata_only=True, keep_open=True)
+        return tdms_file
 
     def __init__(self, file, raw_timestamps=False, memmap_dir=None, read_metadata_only=False, keep_open=False):
         """Initialise a new TdmsFile object
