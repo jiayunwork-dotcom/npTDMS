@@ -268,6 +268,41 @@ class TdmsFile(object):
         """
         return hdf_export.from_tdms_file(self, filepath, mode, group)
 
+    def write_hdf5_archive(self, filepath, chunk_samples=100000):
+        """ Write a lossless, reversible HDF5 archive of this TDMS file
+
+        Unlike :meth:`as_hdf`, the archive stores raw unscaled samples, full
+        TDMS type information and timestamps with complete 64 bit second
+        fractions, so the original TDMS file can later be rebuilt with
+        :meth:`restore_hdf5_archive` without keeping the source file or
+        embedding its raw bytes.
+
+        The target path must not already exist.  Both fully read TDMS files
+        and files opened with :meth:`open` are supported; the latter stream
+        data one source chunk at a time.
+
+        :param filepath: The path of the new HDF5 archive to write to.
+        :param chunk_samples: HDF5 chunk size in samples for channel datasets.
+        """
+        from nptdms.export.hdf_archive import export_tdms_to_hdf5
+        return export_tdms_to_hdf5(self, filepath, chunk_samples=chunk_samples)
+
+    @staticmethod
+    def restore_hdf5_archive(hdf5_path, tdms_path, batch_size=1000000):
+        """ Restore a TDMS file from an HDF5 archive written by write_hdf5_archive
+
+        The target path must not already exist.  Data is read back in bounded
+        batches that are fed to the TDMS writer, so restoring a long channel
+        never buffers the whole channel in memory.
+
+        :param hdf5_path: Path to the HDF5 archive.
+        :param tdms_path: Path of the new TDMS file to create.
+        :param batch_size: Maximum number of samples processed per batch.
+        """
+        from nptdms.export.hdf_archive import restore_tdms_from_hdf5
+        return restore_tdms_from_hdf5(
+            hdf5_path, tdms_path, batch_size=batch_size)
+
     def data_chunks(self):
         """ A generator that streams chunks of data from disk.
         This method may only be used when the TDMS file was opened without reading all data immediately.

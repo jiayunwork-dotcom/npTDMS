@@ -15,6 +15,7 @@ Contents
     quickstart
     reading
     writing
+    archiving
     apireference
     tdmsinfo
     limitations

@@ -39,6 +39,22 @@ Reading TDMS Files
 .. autoclass:: nptdms.tdms.ChannelSegmentStatus()
   :members:
 
+Reversible HDF5 Archives
+------------------------
+
+.. autofunction:: export_tdms_to_hdf5
+
+.. autofunction:: restore_tdms_from_hdf5
+
+.. autoclass:: ArchiveError
+  :members:
+
+.. autoclass:: ArchiveFormatError
+  :members:
+
+.. autoclass:: UnsupportedArchiveTypeError
+  :members:
+
 Writing TDMS Files
 ------------------
 

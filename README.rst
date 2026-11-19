@@ -59,6 +59,27 @@ Using npTDMS to write a TDMS file looks like::
 For more detailed documentation on reading and writing TDMS files,
 see the `npTDMS documentation <http://nptdms.readthedocs.io>`__.
 
+Lossless HDF5 archives
+----------------------
+
+The regular ``as_hdf`` export writes scaled values and microsecond-resolution
+timestamp text, so it cannot rebuild the original TDMS file.  For long term
+storage, npTDMS also provides a reversible archive that keeps raw unscaled
+samples, full 64 bit timestamp fractions and all type information::
+
+    from nptdms import TdmsFile
+
+    # Write a new HDF5 archive (the target path must not exist).
+    with TdmsFile.open("acquisition.tdms", raw_timestamps=True) as tdms_file:
+        tdms_file.write_hdf5_archive("acquisition.h5")
+
+    # Rebuild the TDMS file later, without the original source file.
+    TdmsFile.restore_hdf5_archive(
+        "acquisition.h5", "acquisition_restored.tdms", batch_size=100000)
+
+See the archiving chapter of the documentation for the archive format and its
+streaming and error handling behaviour.
+
 Installation
 ------------
 

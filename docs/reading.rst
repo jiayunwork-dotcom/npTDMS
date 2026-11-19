@@ -249,6 +249,11 @@ In addition there is an :py:meth:`~nptdms.TdmsGroup.as_dataframe` method on :py:
 and an :py:meth:`~nptdms.TdmsGroup.as_dataframe` method on :py:class:`~nptdms.TdmsChannel`
 for converting a single group or channel to a Pandas DataFrame.
 
+Note that :py:meth:`~nptdms.TdmsFile.as_hdf` writes scaled values and
+microsecond-resolution timestamp text, so it is not reversible.  For archiving
+finished acquisitions in a form that can rebuild the original TDMS file, see
+:doc:`archiving` instead.
+
 Thread safety
 -------------
 

@@ -563,3 +563,74 @@ def test_defragment_raw_timestamp_file():
         for (group, channel), expected_values in expected_data.items():
             channel_data = f[group][channel][:]
             np.testing.assert_equal(channel_data, expected_values)
+
+
+def test_timestamp_channel_followed_by_other_segment():
+    """Timestamp bytes must match the size declared in the segment lead-in.
+
+    Regression test: timestamps written from a list of TdmsTimestamp objects
+    previously produced 8 bytes per value in the lead-in calculation but only
+    wrote the field values, corrupting every segment after the timestamp data.
+    """
+    from nptdms.timestamp import TdmsTimestamp
+
+    timestamps = [
+        TdmsTimestamp(3424234234, 1),
+        TdmsTimestamp(-123, 2 ** 64 - 1),
+    ]
+    output_file = BytesIO()
+    with TdmsWriter(output_file) as tdms_writer:
+        tdms_writer.write_segment([
+            ChannelObject("group", "timedata", timestamps)])
+        tdms_writer.write_segment([
+            ChannelObject("group", "numbers", np.arange(2, dtype=np.int32))])
+
+    output_file.seek(0)
+    tdms_file = TdmsFile.read(output_file, raw_timestamps=True)
+    assert list(tdms_file["group"]["timedata"][:]) == timestamps
+    np.testing.assert_array_equal(
+        tdms_file["group"]["numbers"][:], np.arange(2, dtype=np.int32))
+
+
+def test_timestamp_array_wire_order_is_preserved():
+    """Structured timestamp arrays are serialised in the TDMS field order."""
+    from nptdms.timestamp import TdmsTimestamp, TimestampArray
+
+    timestamps = [
+        TdmsTimestamp(3424234234, 1),
+        TdmsTimestamp(-123, 2 ** 64 - 1),
+    ]
+    timestamp_array = TimestampArray(np.array(
+        [(t.seconds, t.second_fractions) for t in timestamps],
+        dtype=np.dtype([('seconds', '<i8'), ('second_fractions', '<u8')])))
+
+    output_file = BytesIO()
+    with TdmsWriter(output_file) as tdms_writer:
+        tdms_writer.write_segment([
+            ChannelObject(
+                "group", "timedata", timestamp_array,
+                data_type=types.TimeStamp)])
+
+    output_file.seek(0)
+    tdms_file = TdmsFile.read(output_file, raw_timestamps=True)
+    assert list(tdms_file["group"]["timedata"][:]) == timestamps
+
+
+def test_empty_typed_channel_preserves_its_type():
+    """Empty channels keep their declared data type through the writer."""
+    output_file = BytesIO()
+    with TdmsWriter(output_file) as tdms_writer:
+        tdms_writer.write_segment([
+            ChannelObject(
+                "group", "empty_string", np.array([], dtype=object),
+                data_type=types.String)])
+        tdms_writer.write_segment([
+            ChannelObject(
+                "group", "empty_int", np.array([], dtype=np.int32))])
+
+    output_file.seek(0)
+    tdms_file = TdmsFile.read(output_file)
+    assert tdms_file["group"]["empty_string"].data_type == types.String
+    assert len(tdms_file["group"]["empty_string"]) == 0
+    assert tdms_file["group"]["empty_int"].data_type == types.Int32
+    assert len(tdms_file["group"]["empty_int"]) == 0

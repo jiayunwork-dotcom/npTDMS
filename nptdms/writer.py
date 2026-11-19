@@ -8,6 +8,7 @@ import os
 import numpy as np
 from nptdms.common import toc_properties, ObjectPath
 from nptdms.timestamp import TdmsTimestamp
+from nptdms import types
 from nptdms.types import *
 from nptdms import TdmsFile
 
@@ -212,7 +213,7 @@ class TdmsSegment(object):
         return metadata
 
     def raw_data_index(self, obj):
-        if hasattr(obj, 'data'):
+        if hasattr(obj, 'data') and getattr(obj, 'has_data', True):
             data_type = Int32(obj.data_type.enum_value)
             dimension = Uint32(1)
             num_values = Uint64(len(obj.data))
@@ -223,6 +224,19 @@ class TdmsSegment(object):
                 total_size = object_data_size(obj.data_type, obj.data)
                 data_index.append(Uint64(total_size))
 
+            return data_index
+        elif hasattr(obj, 'data_type') and obj.data_type is not None:
+            # A metadata-only channel with a known type and no raw data, as
+            # used for empty channels.  Write a type-aware raw data index with
+            # zero values so readers see the channel's data type.
+            data_index = [
+                Uint32(20),
+                Int32(obj.data_type.enum_value),
+                Uint32(1),
+                Uint64(0),
+            ]
+            if obj.data_type == String:
+                data_index.append(Uint64(0))
             return data_index
         else:
             return [Bytes(b'\xFF\xFF\xFF\xFF')]
@@ -315,7 +329,7 @@ class ChannelObject(TdmsObject):
     """A TDMS object for a channel with data
     """
 
-    def __init__(self, group, channel, data, properties=None):
+    def __init__(self, group, channel, data, properties=None, data_type=None):
         """Initialise a new ChannelObject
 
         :param group: The name of the group this channel is in.
@@ -323,6 +337,12 @@ class ChannelObject(TdmsObject):
         :param data: 1-D Numpy array of data to be written.
         :param properties: A dictionary mapping property names to
             their value.
+        :param data_type: Optional explicit TDMS type class to write the data
+            as, for example ``types.SingleFloatWithUnit`` or
+            ``types.TimeStamp``.  When not given the type is inferred from the
+            data as before.  This is required for empty typed channels and for
+            data whose NumPy dtype does not uniquely identify a TDMS type,
+            such as timestamp arrays.
         """
         self.group = group
         self.channel = channel
@@ -330,6 +350,7 @@ class ChannelObject(TdmsObject):
         if self.data.ndim != 1:
             raise ValueError("Channel data must be a 1d array")
         self.properties = properties
+        self._explicit_data_type = data_type
 
     @property
     def has_data(self):
@@ -337,6 +358,8 @@ class ChannelObject(TdmsObject):
 
     @property
     def data_type(self):
+        if self._explicit_data_type is not None:
+            return self._explicit_data_type
         try:
             return numpy_data_types[self.data.dtype]
         except (AttributeError, KeyError):
@@ -373,9 +396,9 @@ def _to_tdms_value(value):
     if isinstance(value, float):
         return DoubleFloat(value)
     if isinstance(value, datetime):
-        return TimeStamp(value)
+        return types.TimeStamp(value)
     if isinstance(value, np.datetime64):
-        return TimeStamp(value)
+        return types.TimeStamp(value)
     if isinstance(value, TdmsTimestamp):
         return value
     if isinstance(value, str):
@@ -394,10 +417,13 @@ def to_int_property_value(value):
 
 
 def write_data(file, tdms_object):
-    if tdms_object.data_type == TimeStamp:
+    if tdms_object.data_type == TdmsTimestamp or \
+            tdms_object.data_type == types.TimeStamp:
         # Numpy's datetime format isn't compatible with TDMS,
-        # so can't use data.tofile
-        write_values(file, tdms_object.data)
+        # so can't use data.tofile.  Timestamp arrays use a structured dtype
+        # whose field order may not match the TDMS wire layout, so build the
+        # wire-ordered bytes explicitly rather than writing the array directly.
+        write_timestamp_values(file, tdms_object.data)
     elif tdms_object.data_type == String:
         # Strings are variable size so need to be treated specially
         write_string_values(file, tdms_object.data)
@@ -423,6 +449,29 @@ def write_values(file, array):
     file.write(b''.join(_to_tdms_value(val).bytes for val in array))
 
 
+def write_timestamp_values(file, array):
+    """Write timestamp values using the TDMS wire layout.
+
+    TDMS stores each timestamp as second fractions (uint64) followed by
+    seconds since the 1904 epoch (int64).  TimestampArray structured dtypes may
+    use either field order, so serialise field by field instead of relying on
+    the array's in-memory layout.  Object arrays or lists of TdmsTimestamp
+    objects are converted value by value.
+    """
+    wire_dtype = np.dtype([
+        ('second_fractions', '<u8'), ('seconds', '<i8')])
+    if getattr(array, 'dtype', None) is not None and array.dtype.names is not None:
+        wire = np.empty(len(array), dtype=wire_dtype)
+        wire['seconds'] = np.asarray(array['seconds'], dtype='<i8')
+        wire['second_fractions'] = np.asarray(array['second_fractions'], dtype='<u8')
+        to_file(file, wire)
+    else:
+        wire = np.frombuffer(
+            b''.join(_to_tdms_value(val).bytes for val in array),
+            dtype=wire_dtype)
+        to_file(file, wire)
+
+
 def write_string_values(file, strings):
     try:
         encoded_strings = [s.encode("utf-8") for s in strings]
@@ -439,7 +488,7 @@ def write_string_values(file, strings):
 
 def object_data_size(data_type, data_values):
     if data_type == String:
-        # For string data, the total size is 8 bytes per string for the
+        # For string data, the total size is 4 bytes per string for the
         # offsets to the start of each string, plus the length of each string.
         try:
             encoded_strings = [s.encode("utf-8") for s in data_values]
@@ -447,6 +496,10 @@ def object_data_size(data_type, data_values):
             encoded_strings = data_values
         return sum(4 + len(s) for s in encoded_strings)
 
+    if data_type is None or data_type.size is None:
+        # Typeless or otherwise unsized objects (for example an empty channel
+        # whose type cannot be inferred) carry no raw data bytes.
+        return 0
     return data_type.size * len(data_values)
 
 
