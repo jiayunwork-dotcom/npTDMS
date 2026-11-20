@@ -39,6 +39,9 @@ Reading TDMS Files
 .. autoclass:: nptdms.tdms.ChannelSegmentStatus()
   :members:
 
+.. autoclass:: nptdms.tdms.ScalerSegmentStatus()
+  :members:
+
 Writing TDMS Files
 ------------------
 

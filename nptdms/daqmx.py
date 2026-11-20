@@ -15,9 +15,38 @@ FORMAT_CHANGING_SCALER = 0x00001269
 DIGITAL_LINE_SCALER = 0x0000126A
 
 
+class DaqmxFinalChunkLengths(object):
+    """Lengths for a truncated final DAQmx chunk
+
+    :ivar buffer_lengths: Number of complete values available in each raw data buffer.
+    :ivar object_lengths: Number of samples that can be computed for each object.
+    :ivar scaler_lengths: Dictionary of object path to a dictionary mapping scale ID
+        to the number of raw scaler values that will be delivered for the chunk.
+    :ivar scaler_available: Dictionary of object path to a dictionary mapping scale ID
+        to the number of raw scaler values that are available in the buffers,
+        which may be more than are delivered if the channel's scaling cannot use them.
+    """
+
+    __slots__ = ['buffer_lengths', 'object_lengths', 'scaler_lengths', 'scaler_available']
+
+    def __init__(self, buffer_lengths, object_lengths, scaler_lengths, scaler_available):
+        self.buffer_lengths = buffer_lengths
+        self.object_lengths = object_lengths
+        self.scaler_lengths = scaler_lengths
+        self.scaler_available = scaler_available
+
+
 class DaqmxDataReader(BaseDataReader):
     """ A TDMS segment with DAQmx data
     """
+    def __init__(
+            self, num_chunks, final_chunk_lengths_override, endianness,
+            final_chunk_buffer_lengths=None, final_chunk_scaler_lengths=None):
+        super(DaqmxDataReader, self).__init__(
+            num_chunks, final_chunk_lengths_override, endianness)
+        self.final_chunk_buffer_lengths = final_chunk_buffer_lengths
+        self.final_chunk_scaler_lengths = final_chunk_scaler_lengths
+
     def _read_data_chunk(self, file, data_objects, chunk_index):
         """Read data from DAQmx data segment"""
 
@@ -32,9 +61,17 @@ class DaqmxDataReader(BaseDataReader):
         data = {}
         scaler_data = defaultdict(dict)
 
+        is_final_chunk = (
+            self.final_chunk_lengths_override is not None and
+            chunk_index == self.num_chunks - 1)
+        buffer_lengths = self.final_chunk_buffer_lengths if is_final_chunk else None
+
         # Data for each raw data buffer is interleaved separately, so read one after another
         for (raw_buffer_index, buffer_shape) in enumerate(get_buffer_dimensions(data_objects)):
             (chunk_size, raw_data_width) = buffer_shape
+            if buffer_lengths is not None and raw_buffer_index < len(buffer_lengths):
+                # A truncated final chunk may contain fewer complete values in this buffer
+                chunk_size = min(chunk_size, buffer_lengths[raw_buffer_index])
             # Read all data into 1 byte unsigned ints first
             combined_data = read_interleaved_segment_bytes(file, raw_data_width, chunk_size)
 
@@ -56,15 +93,29 @@ class DaqmxDataReader(BaseDataReader):
                     this_scaler_data = scaler.data_type.from_bytes(this_scaler_data, self.endianness)
                     processed_data = scaler.postprocess_data(this_scaler_data)
                     if obj.data_type == types.DaqMxRawData:
+                        if is_final_chunk and self.final_chunk_scaler_lengths is not None:
+                            # Some scalers may have more raw values than can be used by
+                            # the channel's scaling. Only deliver values within the
+                            # length the metadata stage decided on.
+                            scaler_length = self.final_chunk_scaler_lengths.get(
+                                obj.path, {}).get(scaler.scale_id)
+                            if scaler_length is not None:
+                                processed_data = processed_data[:scaler_length]
                         scaler_data[obj.path][scaler.scale_id] = processed_data
                     else:
+                        if is_final_chunk:
+                            processed_data = processed_data[
+                                :self.final_chunk_lengths_override.get(obj.path, 0)]
                         data[obj.path] = processed_data
 
         combined_data = {}
-        for path, data in data.items():
-            combined_data[path] = RawChannelDataChunk.channel_data(data)
-        for path, data in scaler_data.items():
-            combined_data[path] = RawChannelDataChunk.scaler_data(data)
+        for path, path_data in data.items():
+            combined_data[path] = RawChannelDataChunk.channel_data(path_data)
+        for path, path_scaler_data in scaler_data.items():
+            length = (
+                self.final_chunk_lengths_override.get(path, 0)
+                if is_final_chunk else None)
+            combined_data[path] = RawChannelDataChunk.scaler_data(path_scaler_data, length=length)
         return RawDataChunk(combined_data)
 
 
@@ -74,29 +125,106 @@ def get_daqmx_chunk_size(ordered_objects):
     return sum((num_values * width) for (num_values, width) in get_buffer_dimensions(ordered_objects))
 
 
-def get_daqmx_final_chunk_lengths(ordered_objects, chunk_size_bytes):
+def get_daqmx_final_chunk_lengths(ordered_objects, chunk_size_bytes, required_scalers=None):
     """Compute object data lengths for a final chunk that has less data than expected
+
+    :param ordered_objects: DAQmx segment objects for the segment.
+    :param chunk_size_bytes: Number of bytes actually present in the truncated chunk.
+    :param required_scalers: Optional dictionary mapping object path to the set of
+        scaler scale IDs read by the channel's final scaling. Objects with no entry,
+        or with a None entry, are assumed to require all of their scalers.
+    :returns: A DaqmxFinalChunkLengths instance.
+    """
+    buffer_dims = get_buffer_dimensions(ordered_objects)
+    buffer_lengths = _available_buffer_lengths(buffer_dims, chunk_size_bytes)
+    return final_chunk_lengths_from_buffers(ordered_objects, buffer_lengths, required_scalers)
+
+
+def final_chunk_lengths_from_buffers(ordered_objects, buffer_lengths, required_scalers=None):
+    """Compute DAQmx final chunk object and scaler lengths from buffer availability
+
+    :param ordered_objects: DAQmx segment objects for the segment.
+    :param buffer_lengths: Number of complete values available in each raw data buffer.
+    :param required_scalers: Optional dictionary mapping object path to the set of
+        scaler scale IDs read by the channel's final scaling.
+    :returns: A DaqmxFinalChunkLengths instance.
     """
     object_lengths = {}
-    buffer_dims = get_buffer_dimensions(ordered_objects)
-    updated_buffer_lengths = [0] * len(buffer_dims)
-    bytes_remaining = chunk_size_bytes
-    for i, (orig_length, width) in enumerate(buffer_dims):
-        buffer_total_bytes = orig_length * width
-        if bytes_remaining > buffer_total_bytes:
-            updated_buffer_lengths[i] = orig_length
-            bytes_remaining -= buffer_total_bytes
-        else:
-            updated_buffer_lengths[i] = bytes_remaining // width
-            break
+    scaler_lengths = {}
+    scaler_available = {}
     for obj in ordered_objects:
         if not obj.has_data:
             continue
-        buffer_indices = list(set(s.raw_buffer_index for s in obj.daqmx_metadata.scalers))
-        if len(buffer_indices) == 1:
-            object_lengths[obj.path] = updated_buffer_lengths[buffer_indices[0]]
-        # Else scalers are in different buffers, not sure this is even valid
-    return object_lengths
+        scalers = obj.daqmx_metadata.scalers
+        required_ids = _required_scaler_ids(obj, required_scalers, scalers)
+        object_length = obj.number_values
+        for scaler in scalers:
+            if scaler.scale_id not in required_ids:
+                continue
+            available = _available_for_scaler(buffer_lengths, scaler, obj.number_values)
+            object_length = min(object_length, available)
+        object_length = max(object_length, 0)
+        object_lengths[obj.path] = object_length
+        scaler_lengths[obj.path] = {}
+        scaler_available[obj.path] = {}
+        for scaler in scalers:
+            available = _available_for_scaler(buffer_lengths, scaler, obj.number_values)
+            scaler_available[obj.path][scaler.scale_id] = available
+            # Never deliver more values than can be paired with the channel's
+            # computable samples. A scaler that is shorter than that keeps its
+            # own (shorter) length; the difference is visible in file status.
+            scaler_lengths[obj.path][scaler.scale_id] = min(available, object_length)
+    return DaqmxFinalChunkLengths(buffer_lengths, object_lengths, scaler_lengths, scaler_available)
+
+
+def _required_scaler_ids(obj, required_scalers, scalers):
+    """Return the scale IDs that must be present before a sample can be computed
+
+    If the final scaling cannot be resolved, or reads none of this object's
+    scalers, every scaler is treated as required so that no scalar values are
+    assembled by broadcasting mismatched inputs.
+    """
+    all_ids = set(scaler.scale_id for scaler in scalers)
+    if required_scalers is None or obj.path not in required_scalers:
+        return all_ids
+    required = required_scalers[obj.path]
+    if required is None:
+        return all_ids
+    selected = required & all_ids
+    return selected if selected else all_ids
+
+
+def _available_for_scaler(buffer_lengths, scaler, number_values):
+    buffer_index = scaler.raw_buffer_index
+    if 0 <= buffer_index < len(buffer_lengths):
+        available = buffer_lengths[buffer_index]
+    else:
+        available = 0
+    return max(0, min(number_values, available))
+
+
+def _available_buffer_lengths(buffer_dims, chunk_size_bytes):
+    """Compute how many complete values are available in each raw data buffer
+
+    Raw data buffers are written one after another in a chunk, so a truncated
+    chunk may contain complete data for some buffers and a partial or empty
+    final buffer. Bytes that don't form a complete value are not usable.
+    """
+    buffer_lengths = [0] * len(buffer_dims)
+    bytes_remaining = int(chunk_size_bytes)
+    for i, (buffer_num_values, width) in enumerate(buffer_dims):
+        buffer_num_values = int(buffer_num_values)
+        width = int(width)
+        if width <= 0:
+            continue
+        buffer_total_bytes = buffer_num_values * width
+        if bytes_remaining >= buffer_total_bytes:
+            buffer_lengths[i] = buffer_num_values
+            bytes_remaining -= buffer_total_bytes
+        else:
+            buffer_lengths[i] = max(0, bytes_remaining) // width
+            break
+    return buffer_lengths
 
 
 def get_buffer_dimensions(ordered_objects):

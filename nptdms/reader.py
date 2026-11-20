@@ -7,7 +7,7 @@ import os
 import numpy as np
 import struct
 
-from nptdms.common import toc_properties
+from nptdms.common import toc_properties, ObjectPath
 from nptdms.utils import Timer
 from nptdms.base_segment import RawChannelDataChunk
 from nptdms.tdms_segment import TdmsSegment, SegmentIndexCache
@@ -122,8 +122,9 @@ class TdmsReader(object):
                         # We've finished reading the file
                         break
 
-                    self._update_object_metadata(segment)
                     self._update_object_properties(properties)
+                    self._set_segment_scaling_properties(segment)
+                    self._update_object_metadata(segment)
                     self._segments.append(segment)
                     previous_segment = segment
 
@@ -383,6 +384,36 @@ class TdmsReader(object):
                 for prop, val in properties:
                     object_metadata.properties[prop] = val
 
+    def _set_segment_scaling_properties(self, segment):
+        """Give a segment the channel, group and file properties needed to compute
+        which DAQmx scalers its final scaling uses.
+
+        This is only needed for segments with a truncated final chunk, so the
+        cost is limited to incomplete files and no extra data is read. A
+        metadata-reuse segment is still handled because it is itself truncated
+        and gets its properties looked up from the metadata read so far.
+        """
+        if segment.final_chunk_remainder is None:
+            return
+        if not segment._have_daqmx_objects():
+            return
+        root_metadata = self.object_metadata.get('/')
+        file_properties = {} if root_metadata is None else root_metadata.properties
+        scaling_properties = {}
+        for segment_object in segment.ordered_objects:
+            if not segment_object.has_data:
+                continue
+            path = segment_object.path
+            channel_metadata = self.object_metadata.get(path)
+            channel_properties = {} if channel_metadata is None else channel_metadata.properties
+            group_path = _group_path(path)
+            group_properties = (
+                self.object_metadata[group_path].properties
+                if group_path in self.object_metadata else {})
+            scaling_properties[path] = (
+                channel_properties, group_properties, file_properties)
+        segment.set_object_properties(scaling_properties)
+
     def _get_or_create_object(self, path):
         """ Get existing object metadata or create metadata for a new object
         """
@@ -433,6 +464,12 @@ class TdmsReader(object):
         if self._file is None and self._index_file is None:
             raise RuntimeError(
                 "Cannot read data after the underlying TDMS reader is closed")
+
+
+def _group_path(path):
+    """Get the object path of the group containing a channel path
+    """
+    return ObjectPath.from_string(path).group_path()
 
 
 def _number_of_segment_values(segment_object, segment):
@@ -487,10 +524,17 @@ def _trim_channel_chunk(chunk, skip=0, trim=0):
     if chunk.data is not None:
         data = chunk.data[skip:len(chunk.data) - trim]
     if chunk.scaler_data is not None:
-        scaler_data = {
-            scale_id: d[skip:len(d) - trim]
-            for (scale_id, d) in chunk.scaler_data.items()}
-    return RawChannelDataChunk(data, scaler_data)
+        # Scalers may have different lengths in a truncated final chunk, so
+        # trim each one from its own end rather than assuming a common length.
+        scaler_data = {}
+        for (scale_id, d) in chunk.scaler_data.items():
+            start = min(skip, len(d))
+            end = max(start, len(d) - trim)
+            scaler_data[scale_id] = d[start:end]
+    length = None
+    if chunk.length is not None:
+        length = max(0, chunk.length - skip - trim)
+    return RawChannelDataChunk(data, scaler_data, length=length)
 
 
 def _deduplicate_array(xs, candidates):

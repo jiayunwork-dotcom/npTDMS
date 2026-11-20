@@ -3,7 +3,7 @@ import os
 import numpy as np
 import struct
 
-from nptdms import types
+from nptdms import types, scaling
 from nptdms.common import toc_properties
 from nptdms.log import log_manager
 from nptdms.base_segment import (
@@ -43,11 +43,14 @@ class TdmsSegment(object):
         'next_segment_pos',
         'data_position',
         'final_chunk_lengths_override',
+        'final_chunk_lengths_details',
+        'final_chunk_remainder',
         'object_index',
         'segment_incomplete',
         'has_daqmx_objects_cached',
         'chunk_size_cached',
         'data_objects_cached',
+        '_object_properties',
     ]
 
     def __init__(self, position, toc_mask, next_segment_pos, data_position, segment_incomplete):
@@ -57,12 +60,15 @@ class TdmsSegment(object):
         self.data_position = data_position
         self.num_chunks = 0
         self.final_chunk_lengths_override = None
+        self.final_chunk_lengths_details = None
+        self.final_chunk_remainder = None
         self.ordered_objects = None
         self.object_index = None
         self.segment_incomplete = segment_incomplete
         self.has_daqmx_objects_cached = None
         self.chunk_size_cached = None
         self.data_objects_cached = None
+        self._object_properties = None
 
     def __repr__(self):
         return "<TdmsSegment at position %d>" % self.position
@@ -206,6 +212,9 @@ class TdmsSegment(object):
         try:
             self.ordered_objects = previous_segment.ordered_objects
             self.object_index = previous_segment.object_index
+            # Carry over scaling properties so a truncated segment without its
+            # own metadata block can still work out which scalers are required.
+            self._object_properties = previous_segment._object_properties
             self._calculate_chunks()
         except AttributeError:
             raise ValueError(
@@ -291,6 +300,10 @@ class TdmsSegment(object):
 
         data_size = self._get_chunk_size()
 
+        self.final_chunk_remainder = None
+        self.final_chunk_lengths_override = None
+        self.final_chunk_lengths_details = None
+
         total_data_size = self.next_segment_pos - self.data_position
         if data_size < 0 or total_data_size < 0:
             raise ValueError("Negative data size")
@@ -311,15 +324,49 @@ class TdmsSegment(object):
                 "chunk size %d. Will attempt to read last chunk",
                 total_data_size, data_size)
             self.num_chunks = 1 + int(total_data_size // data_size)
+            self.final_chunk_remainder = chunk_remainder
+            self._update_final_chunk_lengths()
+
+    def _update_final_chunk_lengths(self, required_scalers=None):
+        """Recompute overrides for a truncated final chunk
+
+        This is called once metadata is known and again once channel properties
+        are available, so that the channel's final scaling can determine which
+        raw scalers are required.
+        """
+        if self.final_chunk_remainder is None:
+            return
+        if self._have_daqmx_objects():
+            required = (
+                required_scalers if required_scalers is not None
+                else self._get_required_scalers())
+            details = get_daqmx_final_chunk_lengths(
+                self.ordered_objects, self.final_chunk_remainder, required)
+            self.final_chunk_lengths_details = details
+            self.final_chunk_lengths_override = details.object_lengths
+        else:
             self.final_chunk_lengths_override = self._compute_final_chunk_lengths(
-                data_size, chunk_remainder)
+                self._get_chunk_size(), self.final_chunk_remainder)
+
+    def _get_required_scalers(self):
+        """Get scaler IDs read by the final scaling of each channel in this segment
+        """
+        required_scalers = {}
+        for obj in self.ordered_objects:
+            if not obj.has_data:
+                continue
+            scaling_properties = (self._object_properties or {}).get(obj.path)
+            if scaling_properties is None:
+                required_scalers[obj.path] = None
+            else:
+                (channel_props, group_props, file_props) = scaling_properties
+                required_scalers[obj.path] = scaling.get_daqmx_scaler_dependencies(
+                    channel_props, group_props, file_props)
+        return required_scalers
 
     def _compute_final_chunk_lengths(self, chunk_size, chunk_remainder):
         """Compute object data lengths for a final chunk that has less data than expected
         """
-        if self._have_daqmx_objects():
-            return get_daqmx_final_chunk_lengths(self.ordered_objects, chunk_remainder)
-
         obj_chunk_sizes = {}
 
         if any(o for o in self.ordered_objects if o.has_data and o.data_type.size is None):
@@ -346,6 +393,13 @@ class TdmsSegment(object):
                     break
 
         return obj_chunk_sizes
+
+    def set_object_properties(self, properties):
+        """Provide channel properties for this segment so final chunk lengths can use scaling
+        """
+        self._object_properties = properties
+        if self.final_chunk_remainder is not None and self._have_daqmx_objects():
+            self._update_final_chunk_lengths()
 
     def _new_segment_object(self, object_path, raw_data_index_header):
         """ Create a new segment object for a segment
@@ -391,7 +445,11 @@ class TdmsSegment(object):
     def _get_data_reader(self):
         endianness = '>' if (self.toc_mask & toc_properties['kTocBigEndian']) else '<'
         if self._have_daqmx_objects():
-            return DaqmxDataReader(self.num_chunks, self.final_chunk_lengths_override, endianness)
+            details = self.final_chunk_lengths_details
+            return DaqmxDataReader(
+                self.num_chunks, self.final_chunk_lengths_override, endianness,
+                final_chunk_buffer_lengths=(None if details is None else details.buffer_lengths),
+                final_chunk_scaler_lengths=(None if details is None else details.scaler_lengths))
         elif self._have_interleaved_data():
             return InterleavedDataReader(self.num_chunks, self.final_chunk_lengths_override, endianness)
         else:

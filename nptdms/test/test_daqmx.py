@@ -3,6 +3,7 @@
 
 from collections import defaultdict
 import logging
+import tempfile
 import numpy as np
 import pytest
 
@@ -1083,3 +1084,487 @@ def daqmx_channel_metadata(
         # Raw data width values
         "".join(hexlify_value("<I", v) for v in raw_data_widths) +
         hex_properties(properties))
+
+
+def daqmx_channel_scaling_properties(number_of_scales, scale_properties=None):
+    """Build channel properties that configure DAQmx scaling
+
+    :param number_of_scales: Value of the NI_Number_Of_Scales property
+    :param scale_properties: Dictionary of additional property name to
+        (property type, hex encoded value) pairs.
+    """
+    properties = {
+        "NI_Number_Of_Scales": (3, hexlify_value("<i", number_of_scales)),
+    }
+    if scale_properties is not None:
+        properties.update(scale_properties)
+    return properties
+
+
+def daqmx_string_property(value):
+    """Hex encoded value for a string TDMS property"""
+    encoded = value.encode("utf-8")
+    return hexlify_value("<I", len(encoded)) + string_hexlify(value)
+
+
+def daqmx_int_property(value):
+    """Hex encoded value for an int32 TDMS property"""
+    return hexlify_value("<i", value)
+
+
+def daqmx_add_scaling_properties(left_source, right_source, scale_index=2):
+    """Channel properties for an Add scale reading two other scales"""
+    prefix = "NI_Scale[%d]" % scale_index
+    return daqmx_channel_scaling_properties(scale_index + 1, {
+        prefix + "_Scale_Type": (0x20, daqmx_string_property("Add")),
+        prefix + "_Add_Left_Operand_Input_Source": (3, daqmx_int_property(left_source)),
+        prefix + "_Add_Right_Operand_Input_Source": (3, daqmx_int_property(right_source)),
+    })
+
+
+def _split_buffer_data(buffers):
+    """Join per-buffer lists of values into the byte string for one chunk
+
+    :param buffers: List of per-buffer byte strings, in buffer order.
+    """
+    return "".join(buffers)
+
+
+def _i16_data(values):
+    return "".join(hexlify_value("<h", v) for v in values)
+
+
+def _truncated_two_buffer_file(
+        channel_c_scaler_1_values, channel_a_values, extra_segments=0):
+    """Build a DAQmx file with complete chunks then an incomplete final chunk
+
+    Channel C has scaler 0 from buffer 0 and scaler 1 from buffer 1, and its
+    final scale adds the two scalers. Channel A only has a scaler in buffer 0.
+
+    :param channel_c_scaler_1_values: Values in buffer 1 of the incomplete chunk.
+    :param channel_a_values: Values in buffer 0 of the incomplete chunk.
+    :param extra_segments: Number of additional complete chunks to write before
+        the incomplete final chunk.
+    """
+    c_properties = daqmx_add_scaling_properties(0, 1)
+    a_properties = daqmx_channel_scaling_properties(1)
+
+    c_scaler_0 = daqmx_scaler_metadata(0, 3, 0, 0)
+    c_scaler_1 = daqmx_scaler_metadata(1, 3, 0, 1)
+    a_scaler_0 = daqmx_scaler_metadata(0, 3, 0, 0)
+    metadata = segment_objects_metadata(
+        root_metadata(),
+        group_metadata(),
+        daqmx_channel_metadata("C", 4, [2, 2], [c_scaler_0, c_scaler_1], properties=c_properties),
+        daqmx_channel_metadata("A", 4, [2, 2], [a_scaler_0], properties=a_properties))
+
+    complete_data = _i16_data([1, 2, 3, 4]) + _i16_data([10, 20, 30, 40])
+    final_data = _i16_data(channel_a_values) + _i16_data(channel_c_scaler_1_values)
+
+    test_file = GeneratedFile()
+    for _ in range(extra_segments + 1):
+        test_file.add_segment(segment_toc(), metadata, complete_data)
+    test_file.add_segment(segment_toc(), metadata, final_data, incomplete=True)
+    return test_file
+
+
+def test_truncated_final_chunk_with_scalers_in_different_buffers():
+    """ A truncated DAQmx chunk can compute a sample only when all inputs used by
+    the final scaling have a value.
+
+    Channel C adds scaler 0 (buffer 0) and scaler 1 (buffer 1). Buffer 0 is
+    complete for the final chunk, buffer 1 only has one value, so only the
+    first sample of the final chunk is computable. The extra buffer 0 values
+    must not be broadcast against the single buffer 1 value.
+    """
+    test_file = _truncated_two_buffer_file([50], [5, 6, 7, 8])
+
+    tdms_data = test_file.load()
+    channel_c = tdms_data["Group"]["C"]
+    channel_a = tdms_data["Group"]["A"]
+
+    np.testing.assert_array_equal(channel_c[:], [11, 22, 33, 44, 55])
+    np.testing.assert_array_equal(channel_c.data, [11, 22, 33, 44, 55])
+    # Only the common computable range is delivered for the scalers used by the
+    # final scaling; the extra raw buffer 0 values are not padded or broadcast.
+    np.testing.assert_array_equal(channel_c.raw_scaler_data[0], [1, 2, 3, 4, 5])
+    np.testing.assert_array_equal(channel_c.raw_scaler_data[1], [10, 20, 30, 40, 50])
+
+    # Channel A doesn't depend on buffer 1, so none of its samples are lost
+    np.testing.assert_array_equal(channel_a[:], [1, 2, 3, 4, 5, 6, 7, 8])
+
+    file_status = tdms_data.file_status
+    assert file_status.incomplete_final_segment
+    c_status = file_status.channel_statuses["/'Group'/'C'"]
+    assert c_status.expected_length == 4
+    assert c_status.read_length == 1
+    a_status = file_status.channel_statuses["/'Group'/'A'"]
+    assert a_status.expected_length == 4
+    assert a_status.read_length == 4
+
+    # The undelivered difference is reported: buffer 0 had four complete raw
+    # values but only one could be paired with buffer 1.
+    assert c_status.scaler_statuses[0].available_length == 4
+    assert c_status.scaler_statuses[0].read_length == 1
+    assert c_status.scaler_statuses[1].available_length == 1
+    assert c_status.scaler_statuses[1].read_length == 1
+
+
+def test_truncated_final_chunk_lengths_match_across_entry_points():
+    """ read, read_metadata and lazy channels must agree on the computable range """
+    test_file = _truncated_two_buffer_file([50], [5, 6, 7, 8])
+
+    read_file = test_file.load()
+    metadata_file = TdmsFile.read_metadata(test_file.get_bytes_io_file())
+
+    assert len(read_file["Group"]["C"]) == 5
+    assert len(metadata_file["Group"]["C"]) == 5
+    assert len(read_file["Group"]["A"]) == 8
+    assert len(metadata_file["Group"]["A"]) == 8
+
+    with TdmsFile.open(test_file.get_bytes_io_file()) as lazy_file:
+        assert len(lazy_file["Group"]["C"]) == 5
+        assert len(lazy_file["Group"]["A"]) == 8
+        np.testing.assert_array_equal(lazy_file["Group"]["C"][:], [11, 22, 33, 44, 55])
+        np.testing.assert_array_equal(lazy_file["Group"]["A"][:], [1, 2, 3, 4, 5, 6, 7, 8])
+
+        for channel_name in ["C", "A"]:
+            channel = lazy_file["Group"][channel_name]
+            data = channel.read_data()
+            np.testing.assert_array_equal(data, read_file["Group"][channel_name][:])
+
+        # Indexing and slicing the last values and across the chunk boundary
+        assert lazy_file["Group"]["C"][-1] == 55
+        assert lazy_file["Group"]["C"][-2] == 44
+        np.testing.assert_array_equal(lazy_file["Group"]["C"][-2:], [44, 55])
+        np.testing.assert_array_equal(lazy_file["Group"]["C"][3:5], [44, 55])
+        np.testing.assert_array_equal(lazy_file["Group"]["A"][3:7], [4, 5, 6, 7])
+
+
+def test_truncated_final_chunk_file_data_chunks():
+    """ File level chunk offsets and lengths must follow the recovered range """
+    test_file = _truncated_two_buffer_file([50], [5, 6, 7, 8])
+
+    offsets = {"C": [], "A": []}
+    chunks = {"C": [], "A": []}
+    with TdmsFile.open(test_file.get_bytes_io_file()) as tdms_file:
+        for raw_chunk in tdms_file.data_chunks():
+            for channel_name in ["C", "A"]:
+                channel_chunk = raw_chunk["Group"][channel_name]
+                offsets[channel_name].append(channel_chunk.offset)
+                chunks[channel_name].append(channel_chunk[:])
+
+    assert offsets["C"] == [0, 4]
+    np.testing.assert_array_equal(chunks["C"][0], [11, 22, 33, 44])
+    np.testing.assert_array_equal(chunks["C"][1], [55])
+    assert offsets["A"] == [0, 4]
+    np.testing.assert_array_equal(chunks["A"][0], [1, 2, 3, 4])
+    np.testing.assert_array_equal(chunks["A"][1], [5, 6, 7, 8])
+
+
+def test_truncated_final_chunk_channel_data_chunks():
+    """ Channel level chunk offsets and lengths must follow the recovered range """
+    test_file = _truncated_two_buffer_file([50], [5, 6, 7, 8])
+
+    with TdmsFile.open(test_file.get_bytes_io_file()) as tdms_file:
+        for channel_name, expected_chunks, expected_offsets in [
+                ("C", [[11, 22, 33, 44], [55]], [0, 4]),
+                ("A", [[1, 2, 3, 4], [5, 6, 7, 8]], [0, 4])]:
+            channel = tdms_file["Group"][channel_name]
+            actual_chunks = []
+            actual_offsets = []
+            for chunk in channel.data_chunks():
+                actual_chunks.append(chunk[:])
+                actual_offsets.append(chunk.offset)
+            assert actual_offsets == expected_offsets
+            assert len(actual_chunks) == len(expected_chunks)
+            for (actual, expected) in zip(actual_chunks, expected_chunks):
+                np.testing.assert_array_equal(actual, expected)
+
+
+def test_truncated_final_chunk_raw_scaler_lengths_across_read_modes():
+    """ Raw scaler lengths are consistent for read, lazy and memmap reading """
+    test_file = _truncated_two_buffer_file([50], [5, 6, 7, 8])
+
+    def check_channel(channel):
+        np.testing.assert_array_equal(channel.raw_scaler_data[0], [1, 2, 3, 4, 5])
+        np.testing.assert_array_equal(channel.raw_scaler_data[1], [10, 20, 30, 40, 50])
+        raw_data = channel.read_data(scaled=False)
+        np.testing.assert_array_equal(raw_data[0], [1, 2, 3, 4, 5])
+        np.testing.assert_array_equal(raw_data[1], [10, 20, 30, 40, 50])
+
+    check_channel(test_file.load()["Group"]["C"])
+
+    with test_file.get_tempfile() as temp_file:
+        with TdmsFile.open(temp_file.file) as tdms_file:
+            np.testing.assert_array_equal(tdms_file["Group"]["C"].read_data(scaled=False)[0],
+                                          [1, 2, 3, 4, 5])
+            np.testing.assert_array_equal(tdms_file["Group"]["C"].read_data(scaled=False)[1],
+                                          [10, 20, 30, 40, 50])
+
+    with tempfile.TemporaryDirectory() as memmap_dir:
+        check_channel(test_file.load(memmap_dir=memmap_dir)["Group"]["C"])
+
+
+def test_truncated_final_chunk_ending_on_buffer_boundary():
+    """ Final chunk ends exactly on a buffer boundary: buffer 0 complete, buffer 1 absent """
+    test_file = _truncated_two_buffer_file([], [5, 6, 7, 8])
+
+    tdms_data = test_file.load()
+    np.testing.assert_array_equal(tdms_data["Group"]["C"][:], [11, 22, 33, 44])
+    np.testing.assert_array_equal(tdms_data["Group"]["A"][:], [1, 2, 3, 4, 5, 6, 7, 8])
+    # The unused raw buffer 0 tail is reported, not silently dropped
+    np.testing.assert_array_equal(tdms_data["Group"]["C"].raw_scaler_data[0], [1, 2, 3, 4])
+
+    c_status = tdms_data.file_status.channel_statuses["/'Group'/'C'"]
+    assert c_status.read_length == 0
+    assert c_status.scaler_statuses[0].available_length == 4
+    assert c_status.scaler_statuses[0].read_length == 0
+    assert c_status.scaler_statuses[1].available_length == 0
+    assert c_status.scaler_statuses[1].read_length == 0
+
+    with TdmsFile.open(test_file.get_bytes_io_file()) as lazy_file:
+        assert len(lazy_file["Group"]["C"]) == 4
+        assert len(lazy_file["Group"]["A"]) == 8
+
+
+@pytest.mark.parametrize("partial_buffer_1_bytes, expected_c_samples", [
+    (["32"], []),                          # Half of a value, no complete value
+    (["32", "00", "33"], [55]),            # One complete value and a half, the tail byte is unusable
+])
+def test_truncated_final_chunk_ending_mid_value(partial_buffer_1_bytes, expected_c_samples):
+    """ A partial trailing value must not be used to compute a sample """
+    c_properties = daqmx_add_scaling_properties(0, 1)
+    a_properties = daqmx_channel_scaling_properties(1)
+    c_scaler_0 = daqmx_scaler_metadata(0, 3, 0, 0)
+    c_scaler_1 = daqmx_scaler_metadata(1, 3, 0, 1)
+    a_scaler_0 = daqmx_scaler_metadata(0, 3, 0, 0)
+    metadata = segment_objects_metadata(
+        root_metadata(),
+        group_metadata(),
+        daqmx_channel_metadata("C", 4, [2, 2], [c_scaler_0, c_scaler_1], properties=c_properties),
+        daqmx_channel_metadata("A", 4, [2, 2], [a_scaler_0], properties=a_properties))
+    complete_data = _i16_data([1, 2, 3, 4]) + _i16_data([10, 20, 30, 40])
+    partial_data = _i16_data([5, 6, 7, 8]) + "".join(partial_buffer_1_bytes)
+
+    test_file = GeneratedFile()
+    test_file.add_segment(segment_toc(), metadata, complete_data)
+    test_file.add_segment(segment_toc(), metadata, partial_data, incomplete=True)
+
+    expected_c = [11, 22, 33, 44] + expected_c_samples
+    tdms_data = test_file.load()
+    np.testing.assert_array_equal(tdms_data["Group"]["C"][:], expected_c)
+    np.testing.assert_array_equal(tdms_data["Group"]["A"][:], [1, 2, 3, 4, 5, 6, 7, 8])
+
+    with TdmsFile.open(test_file.get_bytes_io_file()) as lazy_file:
+        assert len(lazy_file["Group"]["C"]) == len(expected_c)
+        np.testing.assert_array_equal(lazy_file["Group"]["C"][:], expected_c)
+        # The raw scaler holds only the values in the computable range and never
+        # includes the incomplete trailing bytes
+        raw_scaler_1 = lazy_file["Group"]["C"].read_data(scaled=False)[1]
+        assert len(raw_scaler_1) == len(expected_c)
+        np.testing.assert_array_equal(raw_scaler_1, [10, 20, 30, 40] + [50] * len(expected_c_samples))
+        assert lazy_file.file_status.channel_statuses["/'Group'/'C'"].scaler_statuses[1].available_length \
+            == len(expected_c_samples)
+
+
+def test_truncated_final_chunk_after_multiple_complete_chunks():
+    """ Slices, last index and chunk offsets are correct after several complete chunks """
+    test_file = _truncated_two_buffer_file([50], [5, 6, 7, 8], extra_segments=2)
+
+    with TdmsFile.open(test_file.get_bytes_io_file()) as tdms_file:
+        channel_c = tdms_file["Group"]["C"]
+        assert len(channel_c) == 13
+        np.testing.assert_array_equal(
+            channel_c[:], [11, 22, 33, 44] * 3 + [55])
+        np.testing.assert_array_equal(channel_c[3:9], [44, 11, 22, 33, 44, 11])
+        np.testing.assert_array_equal(channel_c[-5:], [11, 22, 33, 44, 55])
+        assert channel_c[-1] == 55
+        assert channel_c[12] == 55
+        assert channel_c[13 - 1] == 55
+
+        channel_a = tdms_file["Group"]["A"]
+        assert len(channel_a) == 16
+        np.testing.assert_array_equal(
+            channel_a[:], [1, 2, 3, 4] * 3 + [5, 6, 7, 8])
+
+        chunks = list(channel_c.data_chunks())
+        assert [chunk.offset for chunk in chunks] == [0, 4, 8, 12]
+        assert [len(chunk) for chunk in chunks] == [4, 4, 4, 1]
+        for chunk in chunks:
+            np.testing.assert_array_equal(
+                chunk[:], channel_c[chunk.offset:chunk.offset + len(chunk)])
+
+        file_offsets = []
+        for raw_chunk in tdms_file.data_chunks():
+            file_offsets.append(raw_chunk["Group"]["C"].offset)
+        assert file_offsets == [0, 4, 8, 12]
+
+
+def test_truncated_final_chunk_with_unused_short_scaler():
+    """ A scaler not read by the final scaling must not shorten the channel """
+    properties = daqmx_channel_scaling_properties(1)
+    # Scaler 0 is read by the final scale; scaler 1 exists but is unused.
+    # They live in different buffers so the unused one can be short.
+    used_scaler = daqmx_scaler_metadata(0, 3, 0, 0)
+    unused_scaler = daqmx_scaler_metadata(1, 3, 0, 1)
+    metadata = segment_objects_metadata(
+        root_metadata(),
+        group_metadata(),
+        daqmx_channel_metadata("Channel1", 4, [2, 2], [used_scaler, unused_scaler], properties=properties))
+    complete_data = _i16_data([1, 2, 3, 4]) + _i16_data([10, 20, 30, 40])
+    final_data = _i16_data([5, 6, 7, 8]) + _i16_data([50])
+
+    test_file = GeneratedFile()
+    test_file.add_segment(segment_toc(), metadata, complete_data)
+    test_file.add_segment(segment_toc(), metadata, final_data, incomplete=True)
+
+    tdms_data = test_file.load()
+    channel = tdms_data["Group"]["Channel1"]
+    np.testing.assert_array_equal(channel[:], [1, 2, 3, 4, 5, 6, 7, 8])
+    np.testing.assert_array_equal(channel.raw_scaler_data[0], [1, 2, 3, 4, 5, 6, 7, 8])
+    # The unused scaler keeps its own, shorter length rather than being padded
+    np.testing.assert_array_equal(channel.raw_scaler_data[1], [10, 20, 30, 40, 50])
+
+    c_status = tdms_data.file_status.channel_statuses["/'Group'/'Channel1'"]
+    assert c_status.expected_length == 4
+    assert c_status.read_length == 4
+    assert c_status.scaler_statuses[1].available_length == 1
+    assert c_status.scaler_statuses[1].read_length == 1
+
+    with TdmsFile.open(test_file.get_bytes_io_file()) as lazy_file:
+        lazy_channel = lazy_file["Group"]["Channel1"]
+        assert len(lazy_channel) == 8
+        np.testing.assert_array_equal(lazy_channel[:], [1, 2, 3, 4, 5, 6, 7, 8])
+        raw_data = lazy_channel.read_data(scaled=False)
+        assert len(raw_data[0]) == 8
+        np.testing.assert_array_equal(raw_data[1], [10, 20, 30, 40, 50])
+
+
+def test_truncated_final_chunk_with_final_scale_using_one_input():
+    """ A final scale that only reads one scaler doesn't depend on the other input """
+    properties = daqmx_add_scaling_properties(0, 0)
+    scaler_0 = daqmx_scaler_metadata(0, 3, 0, 0)
+    scaler_1 = daqmx_scaler_metadata(1, 3, 0, 1)
+    metadata = segment_objects_metadata(
+        root_metadata(),
+        group_metadata(),
+        daqmx_channel_metadata("Channel1", 4, [2, 2], [scaler_0, scaler_1], properties=properties))
+    complete_data = _i16_data([1, 2, 3, 4]) + _i16_data([10, 20, 30, 40])
+    final_data = _i16_data([5, 6, 7, 8]) + _i16_data([50])
+
+    test_file = GeneratedFile()
+    test_file.add_segment(segment_toc(), metadata, complete_data)
+    test_file.add_segment(segment_toc(), metadata, final_data, incomplete=True)
+
+    tdms_data = test_file.load()
+    channel = tdms_data["Group"]["Channel1"]
+    # Final scale is scale 0 added to itself, so no buffer 1 values are needed
+    np.testing.assert_array_equal(channel[:], [2, 4, 6, 8, 10, 12, 14, 16])
+    # Buffer 1 values are kept only where they were complete
+    np.testing.assert_array_equal(channel.raw_scaler_data[1], [10, 20, 30, 40, 50])
+    status = tdms_data.file_status.channel_statuses["/'Group'/'Channel1'"]
+    assert status.read_length == 4
+    assert status.scaler_statuses[1].available_length == 1
+    assert status.scaler_statuses[1].read_length == 1
+
+
+def test_truncated_final_chunk_with_different_buffer_widths_and_types():
+    """ Buffers with different widths and integer types are handled independently """
+    properties = daqmx_channel_scaling_properties(1)
+    # Buffer 0 is an int16 scaler and buffer 1 is an int32 scaler with a wider row.
+    # The final scale reads scale 0; scale 5 exists but is not used by it.
+    scaler_0 = daqmx_scaler_metadata(0, 3, 0, 0)
+    scaler_1 = daqmx_scaler_metadata(5, 5, 0, 1)
+    # A second channel only reads buffer 0 and must keep all of its samples
+    independent_scaler = daqmx_scaler_metadata(0, 3, 0, 0)
+    metadata = segment_objects_metadata(
+        root_metadata(),
+        group_metadata(),
+        daqmx_channel_metadata("Wide", 4, [2, 4], [scaler_0, scaler_1], properties=properties),
+        daqmx_channel_metadata("BufferZero", 4, [2, 4], [independent_scaler], properties=properties))
+    complete_data = _i16_data([1, 2, 3, 4]) + "".join(hexlify_value("<i", v) for v in [10, 20, 30, 40])
+    # Final chunk has all of buffer 0 and one complete int32 in buffer 1
+    final_data = _i16_data([5, 6, 7, 8]) + hexlify_value("<i", 50)
+
+    test_file = GeneratedFile()
+    test_file.add_segment(segment_toc(), metadata, complete_data)
+    test_file.add_segment(segment_toc(), metadata, final_data, incomplete=True)
+
+    tdms_data = test_file.load()
+    channel = tdms_data["Group"]["Wide"]
+    # The final scaling only reads scaler 0, so all eight buffer 0 values are usable
+    np.testing.assert_array_equal(channel[:], [1, 2, 3, 4, 5, 6, 7, 8])
+    np.testing.assert_array_equal(channel.raw_scaler_data[0], [1, 2, 3, 4, 5, 6, 7, 8])
+    np.testing.assert_array_equal(channel.raw_scaler_data[5], [10, 20, 30, 40, 50])
+    assert channel.raw_scaler_data[5].dtype == np.int32
+
+    np.testing.assert_array_equal(
+        tdms_data["Group"]["BufferZero"][:], [1, 2, 3, 4, 5, 6, 7, 8])
+
+    status = tdms_data.file_status.channel_statuses["/'Group'/'Wide'"]
+    assert status.read_length == 4
+    assert status.scaler_statuses[5].available_length == 1
+
+
+def test_truncated_final_chunk_without_metadata_block():
+    """ A truncated final segment reusing the previous structure still gets the scaling right """
+    c_properties = daqmx_add_scaling_properties(0, 1)
+    a_properties = daqmx_channel_scaling_properties(1)
+    metadata = segment_objects_metadata(
+        root_metadata(),
+        group_metadata(),
+        daqmx_channel_metadata(
+            "C", 4, [2, 2],
+            [daqmx_scaler_metadata(0, 3, 0, 0), daqmx_scaler_metadata(1, 3, 0, 1)],
+            properties=c_properties),
+        daqmx_channel_metadata(
+            "A", 4, [2, 2], [daqmx_scaler_metadata(0, 3, 0, 0)], properties=a_properties))
+    complete_data = _i16_data([1, 2, 3, 4]) + _i16_data([10, 20, 30, 40])
+    final_data = _i16_data([5, 6, 7, 8]) + _i16_data([50])
+
+    test_file = GeneratedFile()
+    test_file.add_segment(segment_toc(), metadata, complete_data)
+    # Final segment has no metadata block and reuses the previous object structure
+    test_file.add_segment(("kTocRawData",), "", final_data, incomplete=True)
+
+    tdms_data = test_file.load()
+    np.testing.assert_array_equal(tdms_data["Group"]["C"][:], [11, 22, 33, 44, 55])
+    np.testing.assert_array_equal(tdms_data["Group"]["A"][:], [1, 2, 3, 4, 5, 6, 7, 8])
+
+    with TdmsFile.open(test_file.get_bytes_io_file()) as lazy_file:
+        assert len(lazy_file["Group"]["C"]) == 5
+        np.testing.assert_array_equal(lazy_file["Group"]["C"][:], [11, 22, 33, 44, 55])
+        status = lazy_file.file_status.channel_statuses["/'Group'/'C'"]
+        assert status.read_length == 1
+
+
+def test_truncated_final_chunk_with_three_buffers():
+    """ A channel scaled from a later buffer keeps only that buffer's computable range """
+    properties = daqmx_channel_scaling_properties(1)
+    scaler_0 = daqmx_scaler_metadata(0, 3, 0, 0)
+    scaler_1 = daqmx_scaler_metadata(0, 3, 0, 1)
+    scaler_2 = daqmx_scaler_metadata(0, 3, 0, 2)
+    metadata = segment_objects_metadata(
+        root_metadata(),
+        group_metadata(),
+        daqmx_channel_metadata(
+            "Ch", 4, [2, 2, 2], [scaler_0, scaler_1, scaler_2], properties=properties))
+    complete_data = _i16_data([1, 2, 3, 4]) + _i16_data([10, 20, 30, 40]) + _i16_data([100, 200, 300, 400])
+    final_data = _i16_data([5, 6, 7, 8]) + _i16_data([50, 60, 70, 80]) + _i16_data([500, 600])
+
+    test_file = GeneratedFile()
+    test_file.add_segment(segment_toc(), metadata, complete_data)
+    test_file.add_segment(segment_toc(), metadata, final_data, incomplete=True)
+
+    tdms_data = test_file.load()
+    channel = tdms_data["Group"]["Ch"]
+    np.testing.assert_array_equal(channel[:], [100, 200, 300, 400, 500, 600])
+
+    with TdmsFile.open(test_file.get_bytes_io_file()) as lazy_file:
+        lazy_channel = lazy_file["Group"]["Ch"]
+        assert len(lazy_channel) == 6
+        np.testing.assert_array_equal(lazy_channel[-3:], [400, 500, 600])
+        assert [chunk.offset for chunk in lazy_channel.data_chunks()] == [0, 4]
+        status = lazy_file.file_status.channel_statuses["/'Group'/'Ch'"]
+        assert status.read_length == 2

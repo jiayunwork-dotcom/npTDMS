@@ -226,8 +226,10 @@ class TdmsFile(object):
             incomplete_final_segment = last_segment.segment_incomplete
             last_chunk_overrides = last_segment.final_chunk_lengths_override
             if last_chunk_overrides is not None:
+                details = last_segment.final_chunk_lengths_details
                 channel_statuses = dict(
-                    (obj.path, ChannelSegmentStatus(obj.number_values, last_chunk_overrides.get(obj.path, 0)))
+                    (obj.path, _channel_segment_status(
+                        obj, last_chunk_overrides.get(obj.path, 0), details))
                     for obj in last_segment.ordered_objects
                     if obj.has_data)
             elif incomplete_final_segment:
@@ -1044,11 +1046,35 @@ class FileStatus:
 
 
 class ChannelSegmentStatus:
-    def __init__(self, expected_length, read_length):
+    def __init__(self, expected_length, read_length, scaler_statuses=None):
         #: Number of values expected in the segment
         self.expected_length = expected_length
         #: Number of values read from the segment
         self.read_length = read_length
+        #: Dictionary mapping DAQmx scale IDs to ScalerSegmentStatus objects
+        #: when the segment has DAQmx scaler data with a truncated final chunk
+        self.scaler_statuses = scaler_statuses
+
+
+class ScalerSegmentStatus:
+    def __init__(self, available_length, read_length):
+        #: Number of complete raw values available in the file for this scaler
+        #: in the truncated final chunk. This can be more than read_length when
+        #: the channel's scaling cannot use the extra values.
+        self.available_length = available_length
+        #: Number of raw values delivered for this scaler for this chunk
+        self.read_length = read_length
+
+
+def _channel_segment_status(obj, read_length, details):
+    scaler_statuses = None
+    if details is not None and obj.path in details.scaler_available:
+        available = details.scaler_available[obj.path]
+        delivered = details.scaler_lengths.get(obj.path, {})
+        scaler_statuses = dict(
+            (scale_id, ScalerSegmentStatus(available_length, delivered.get(scale_id, 0)))
+            for (scale_id, available_length) in available.items())
+    return ChannelSegmentStatus(obj.number_values, read_length, scaler_statuses)
 
 
 def _convert_data_chunk(chunk, raw_timestamps):

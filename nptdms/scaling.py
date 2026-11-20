@@ -568,6 +568,48 @@ class MultiScaling(object):
             raise ValueError("Cannot compute scaled data for %r" % scaling)
 
 
+def get_daqmx_scaler_dependencies(channel_properties, group_properties, file_properties):
+    """Return the DAQmx scaler scale IDs that the channel's final scaling reads
+
+    This is used when reading a truncated DAQmx chunk to decide which raw
+    scaler values must be present before a sample can be computed. Scalers
+    that are never read by the final scale must not limit the number of
+    samples that can be returned.
+
+    :returns: A set of integer scale IDs, or None if no scaling information
+        is available and every scaler must be treated as an input.
+    """
+    try:
+        channel_scaling = get_scaling(channel_properties, group_properties, file_properties)
+    except (KeyError, TypeError, ValueError):
+        # Scaling properties are incomplete or not understood; be conservative
+        # and require all available scaler data.
+        return None
+    if not isinstance(channel_scaling, MultiScaling) or not channel_scaling.scalings:
+        return None
+
+    scaler_ids = set()
+
+    def visit(scale_index):
+        if scale_index == RAW_DATA_INPUT_SOURCE:
+            return
+        if not isinstance(scale_index, int) or not (0 <= scale_index < len(channel_scaling.scalings)):
+            return
+        scale = channel_scaling.scalings[scale_index]
+        if scale is None:
+            return
+        if isinstance(scale, DaqMxScalerScaling):
+            scaler_ids.add(scale.scale_id)
+        elif hasattr(scale, 'left_input_source') and hasattr(scale, 'right_input_source'):
+            visit(scale.left_input_source)
+            visit(scale.right_input_source)
+        elif hasattr(scale, 'input_source'):
+            visit(scale.input_source)
+
+    visit(len(channel_scaling.scalings) - 1)
+    return scaler_ids
+
+
 def get_scaling(channel_properties, group_properties, file_properties):
     """ Get scaling for a channel from either the channel itself,
         its group, or the whole TDMS file

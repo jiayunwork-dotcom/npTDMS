@@ -109,12 +109,25 @@ class DaqmxDataReceiver(object):
 
         self.path = obj.path
         self.data = None
-        self.scaler_data = {}
+        self._scaler_data = {}
         self._scaler_insert_positions = {}
         for scaler_id, scaler_type in obj.scaler_data_types.items():
-            self.scaler_data[scaler_id] = _new_numpy_array(
+            self._scaler_data[scaler_id] = _new_numpy_array(
                 scaler_type.nptype, num_values, memmap_dir)
             self._scaler_insert_positions[scaler_id] = 0
+
+    @property
+    def scaler_data(self):
+        """Raw scaler arrays, trimmed to the values actually read for each scaler
+
+        A scaler that is shorter than the channel (for example a scaler that is
+        not used by the final scaling and is missing values in an incomplete
+        final chunk) is returned at its own length rather than including
+        uninitialised padding.
+        """
+        return dict(
+            (scale_id, data[:self._scaler_insert_positions[scale_id]])
+            for (scale_id, data) in self._scaler_data.items())
 
     def append_scaler_data(self, scale_id, new_data):
         """Append new DAQmx scaler data read from a segment
@@ -122,7 +135,7 @@ class DaqmxDataReceiver(object):
 
         log.debug("Adding %d data points for object %s, scaler %d",
                   len(new_data), self.path, scale_id)
-        data_array = self.scaler_data[scale_id]
+        data_array = self._scaler_data[scale_id]
         start_pos = self._scaler_insert_positions[scale_id]
         end_pos = start_pos + len(new_data)
         data_array[start_pos:end_pos] = new_data

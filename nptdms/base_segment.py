@@ -110,13 +110,21 @@ class RawChannelDataChunk(object):
     :ivar data: Raw data in this chunk for a standard TDMS channel.
     :ivar scaler_data: A dictionary of scaler data in this segment for
         DAQmx raw data. Keys are the scaler id and values are data arrays.
+    :ivar length: Number of samples this chunk contributes to the channel.
+        This can be less than the length of individual scaler arrays for a
+        DAQmx chunk with incomplete data, where some scalers have more raw
+        values available than can be used by the channel's final scaling.
+        If None the length is derived from the data arrays.
     """
 
-    def __init__(self, data, scaler_data):
+    def __init__(self, data, scaler_data, length=None):
         self.data = data
         self.scaler_data = scaler_data
+        self.length = length
 
     def __len__(self):
+        if self.length is not None:
+            return self.length
         if self.data is not None:
             return len(self.data)
         elif self.scaler_data is not None:
@@ -125,15 +133,15 @@ class RawChannelDataChunk(object):
 
     @staticmethod
     def empty():
-        return RawChannelDataChunk(None, None)
+        return RawChannelDataChunk(None, None, 0)
 
     @staticmethod
     def channel_data(data):
         return RawChannelDataChunk(data, None)
 
     @staticmethod
-    def scaler_data(data):
-        return RawChannelDataChunk(None, data)
+    def scaler_data(data, length=None):
+        return RawChannelDataChunk(None, data, length)
 
 
 def fromfile(file, dtype, count, *args, **kwargs):

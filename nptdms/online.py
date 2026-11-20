@@ -229,8 +229,9 @@ class OnlineTdmsReader(TdmsReader):
                 raise OnlineTdmsError(
                     "Segment at position %d is corrupt: segment metadata does not end at "
                     "the raw data offset declared in the segment lead-in" % position)
-            self._update_object_metadata(segment)
             self._update_object_properties(properties)
+            self._set_segment_scaling_properties(segment)
+            self._update_object_metadata(segment)
             self._segments.append(segment)
             self._next_segment_position = next_segment_position
 

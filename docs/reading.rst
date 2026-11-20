@@ -213,6 +213,37 @@ When you've opened a TDMS file with :py:meth:`~nptdms.TdmsFile.open`, you instea
 
 This will return an array of raw data, or a dictionary of scaler id to raw scaler data for DAQmx data.
 
+Incomplete files
+----------------
+
+If a file was truncated while it was being written, its final segment may contain
+less data than its metadata says. This is reported by :py:attr:`~nptdms.TdmsFile.file_status`,
+whose :py:attr:`~nptdms.tdms.FileStatus.incomplete_final_segment` flag is true and whose
+:py:attr:`~nptdms.tdms.FileStatus.channel_statuses` dictionary gives the expected length and
+the number of values actually readable for each channel in the truncated segment.
+
+For DAQmx data, a channel's samples are computed from one or more raw scalers that may be
+spread across several interleaved raw data buffers. When the file stops part way through
+the final chunk, some buffers may be complete and others may only contain a few values.
+npTDMS computes the largest number of samples for which every raw scaler used by the
+channel's final scaling has a value. A sample is never produced by padding a missing input
+with zeros or by repeating or broadcasting the last available value. Scalers that are not
+used by the final scaling do not limit that number; a channel that only reads a buffer that
+is complete keeps all of its samples.
+
+The same computable range is used by :py:meth:`~nptdms.TdmsFile.read`,
+:py:meth:`~nptdms.TdmsFile.read_metadata`, lazy channel indexing and slicing, and the
+channel and file level chunk iterators, so their lengths and offsets agree.
+
+**Raw tail values:** raw scaler data in a truncated final chunk is exposed only for the
+computable range, and each scaler is returned at its own length. In the common case where
+all scalers used by the final scaling have the same number of values, this is the common
+range. If a scaler is shorter than the computable range because it is not used by the final
+scaling, it is returned at its shorter length rather than being zero padded. The
+:py:attr:`~nptdms.tdms.ChannelSegmentStatus.scaler_statuses` entry for the channel reports
+both the number of complete raw values available for each scaler and the number actually
+delivered, so an undelivered difference is always visible in the file status.
+
 Online reading of growing files
 -------------------------------
 
