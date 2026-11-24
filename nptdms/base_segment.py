@@ -6,6 +6,12 @@ from nptdms.log import log_manager
 
 log = log_manager.get_logger(__name__)
 
+# Number of values per channel to read at once when streaming data.
+# This is independent of how the TDMS file splits data into storage chunks,
+# so that the amount of data read depends on the number of values requested
+# rather than the storage chunk layout.
+DEFAULT_READ_WINDOW_SIZE = 4096
+
 
 class BaseSegmentObject(object):
     """ Abstract base class for an object in a TDMS segment
@@ -39,10 +45,11 @@ class BaseDataReader(object):
     """ Abstract base class for reading data in a segment
     """
 
-    def __init__(self, num_chunks, final_chunk_lengths_override, endianness):
+    def __init__(self, num_chunks, final_chunk_lengths_override, endianness, data_position=0):
         self.num_chunks = num_chunks
         self.final_chunk_lengths_override = final_chunk_lengths_override
         self.endianness = endianness
+        self.data_position = data_position
 
     def read_data_chunks(self, file, data_objects, num_chunks):
         """ Read multiple data chunks at once
@@ -70,6 +77,35 @@ class BaseDataReader(object):
         # and then select only the requested channel.
         # Derived classes can implement more optimised reading.
         data_chunk = self._read_data_chunk(file, data_objects, chunk_index)
+        return data_chunk_to_channel_chunk(data_chunk, channel_path)
+
+    def read_windows(self, file, data_objects, window_offset, stop_window, window_size):
+        """ Read data in fixed size windows, independent of how data is split into storage chunks
+
+        :returns: Generator of RawDataChunk objects, each containing up to window_size
+            values for each channel that has data in the window.
+        """
+        for window_index in range(window_offset, stop_window):
+            yield self._read_window(file, data_objects, window_index, window_size)
+
+    def read_channel_windows(self, file, data_objects, channel_path, window_offset, stop_window, window_size):
+        """ Read data for a single channel in fixed size windows
+
+        :returns: Generator of RawChannelDataChunk objects, each containing up to
+            window_size values for the requested channel.
+        """
+        for window_index in range(window_offset, stop_window):
+            yield self._read_channel_window(file, data_objects, channel_path, window_index, window_size)
+
+    def _read_window(self, file, data_objects, window_index, window_size):
+        """ Read a fixed size window of data for all channels
+        """
+        raise NotImplementedError("Windowed data reading must be implemented in derived classes")
+
+    def _read_channel_window(self, file, data_objects, channel_path, window_index, window_size):
+        """ Read a fixed size window of data for a single channel
+        """
+        data_chunk = self._read_window(file, data_objects, window_index, window_size)
         return data_chunk_to_channel_chunk(data_chunk, channel_path)
 
 
@@ -141,10 +177,12 @@ def fromfile(file, dtype, count, *args, **kwargs):
 
     itemsize = np.dtype(dtype).itemsize
     buffer = np.zeros(count * itemsize, np.uint8)
-    bytes_read = -1
     offset = 0
-    while bytes_read != 0:
+    while offset < buffer.size:
         bytes_read = file.readinto(buffer[offset:])
+        if bytes_read == 0:
+            # End of file, don't try to read any more data
+            break
         offset += bytes_read
     rounded_bytes = (offset // itemsize) * itemsize
     buffer = buffer[:rounded_bytes]

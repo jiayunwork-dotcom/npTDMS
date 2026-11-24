@@ -13,7 +13,8 @@ from nptdms.base_segment import (
     RawDataChunk,
     read_interleaved_segment_bytes,
     data_chunk_to_channel_chunk,
-    fromfile)
+    fromfile,
+    DEFAULT_READ_WINDOW_SIZE)
 from nptdms.daqmx import (
     FORMAT_CHANGING_SCALER,
     DIGITAL_LINE_SCALER,
@@ -29,6 +30,18 @@ log = log_manager.get_logger(__name__)
 
 RAW_DATA_INDEX_NO_DATA = 0xFFFFFFFF
 RAW_DATA_INDEX_MATCHES_PREVIOUS = 0x00000000
+
+
+def _number_of_segment_values(segment_object, segment):
+    """ Compute the number of values an object has in a segment
+    """
+    if not segment_object.has_data:
+        return 0
+    if segment.final_chunk_lengths_override is None:
+        return segment_object.number_values * segment.num_chunks
+    else:
+        return (segment_object.number_values * (segment.num_chunks - 1) +
+                segment.final_chunk_lengths_override.get(segment_object.path, 0))
 
 
 class TdmsSegment(object):
@@ -282,6 +295,111 @@ class TdmsSegment(object):
         ):
             yield chunk
 
+    @property
+    def supports_windowed_reading(self):
+        """ Whether data in this segment can be read in fixed size windows
+        independent of how it is split into storage chunks.
+
+        This is only supported for non-DAQmx data where all channels with data
+        have a fixed size data type. Other data (DAQmx raw data and strings)
+        is still read one storage chunk at a time.
+        """
+        if not (self.toc_mask & toc_properties['kTocRawData']):
+            return True
+        if self._have_daqmx_objects():
+            return False
+        data_objects = self._get_data_objects()
+        if not data_objects:
+            return True
+        return all(o.data_type.size is not None for o in data_objects)
+
+    def get_num_windows(self, window_size=DEFAULT_READ_WINDOW_SIZE):
+        """ Number of fixed size windows needed to read all data in this segment
+        """
+        if not self.supports_windowed_reading:
+            # Windowed reading falls back to reading storage chunks
+            return self.num_chunks
+        return (self._get_num_segment_rows() + window_size - 1) // window_size
+
+    def read_windows(self, f, window_offset=0, stop_window=None, window_size=DEFAULT_READ_WINDOW_SIZE):
+        """ Read data from this segment as fixed size windows
+
+        :returns: Generator of RawDataChunk objects
+        """
+        if not self.toc_mask & toc_properties['kTocRawData']:
+            yield RawDataChunk.empty()
+            return
+
+        num_windows = self.get_num_windows(window_size)
+        if stop_window is None:
+            stop_window = num_windows
+
+        reader = self._get_data_reader()
+        if not self.supports_windowed_reading:
+            # Fall back to reading storage chunks one at a time.
+            f.seek(self.data_position)
+            chunk_size = self._get_chunk_size()
+            if window_offset > 0:
+                f.seek(chunk_size * window_offset, os.SEEK_CUR)
+            for chunk in self._read_data_chunks(f, self._get_data_objects(), stop_window - window_offset):
+                yield chunk
+            return
+
+        data_objects = self._get_data_objects()
+        for window_index in range(window_offset, stop_window):
+            yield reader._read_window(f, data_objects, window_index, window_size)
+
+    def read_channel_windows(
+            self, f, channel_path, window_offset=0, stop_window=None,
+            window_size=DEFAULT_READ_WINDOW_SIZE):
+        """ Read data for a single channel from this segment as fixed size windows
+
+        :returns: Generator of RawChannelDataChunk objects
+        """
+        if not self.toc_mask & toc_properties['kTocRawData']:
+            yield RawChannelDataChunk.empty()
+            return
+
+        num_windows = self.get_num_windows(window_size)
+        if stop_window is None:
+            stop_window = num_windows
+
+        reader = self._get_data_reader()
+        data_objects = self._get_data_objects()
+        if not self.supports_windowed_reading:
+            # Fall back to reading storage chunks one at a time.
+            f.seek(self.data_position)
+            chunk_size = self._get_chunk_size()
+            if window_offset > 0:
+                f.seek(chunk_size * window_offset, os.SEEK_CUR)
+            for chunk in self._read_channel_data_chunks(
+                    f, data_objects, channel_path, window_offset, stop_window, chunk_size):
+                yield chunk
+            return
+
+        for window_index in range(window_offset, stop_window):
+            yield reader._read_channel_window(f, data_objects, channel_path, window_index, window_size)
+
+    def _get_num_segment_rows(self):
+        """ Number of rows (one value per channel per row) of data in this segment
+        """
+        if self._have_interleaved_data():
+            # All channels have the same number of values in each complete chunk,
+            # but the final chunk may contain a partial number of rows.
+            data_objects = self._get_data_objects()
+            if not data_objects:
+                return 0
+            values_per_chunk = data_objects[0].number_values
+            if self.final_chunk_lengths_override is None:
+                return values_per_chunk * self.num_chunks
+            final_length = self.final_chunk_lengths_override.get(data_objects[0].path, 0)
+            return values_per_chunk * (self.num_chunks - 1) + final_length
+        # For contiguous data, use the maximum channel length as the number of rows,
+        # since channels may have different lengths.
+        return max(
+            (_number_of_segment_values(obj, self) for obj in self._get_data_objects()),
+            default=0)
+
     def _calculate_chunks(self):
         """
         Work out the number of chunks the data is in, for cases
@@ -391,11 +509,14 @@ class TdmsSegment(object):
     def _get_data_reader(self):
         endianness = '>' if (self.toc_mask & toc_properties['kTocBigEndian']) else '<'
         if self._have_daqmx_objects():
-            return DaqmxDataReader(self.num_chunks, self.final_chunk_lengths_override, endianness)
+            return DaqmxDataReader(
+                self.num_chunks, self.final_chunk_lengths_override, endianness, self.data_position)
         elif self._have_interleaved_data():
-            return InterleavedDataReader(self.num_chunks, self.final_chunk_lengths_override, endianness)
+            return InterleavedDataReader(
+                self.num_chunks, self.final_chunk_lengths_override, endianness, self.data_position)
         else:
-            return ContiguousDataReader(self.num_chunks, self.final_chunk_lengths_override, endianness)
+            return ContiguousDataReader(
+                self.num_chunks, self.final_chunk_lengths_override, endianness, self.data_position)
 
     def _have_daqmx_objects(self):
         if self.has_daqmx_objects_cached is not None:
@@ -500,6 +621,125 @@ class InterleavedDataReader(BaseDataReader):
 
         return RawDataChunk.channel_data(channel_data)
 
+    def _read_window(self, file, data_objects, window_index, window_size):
+        """ Read a fixed size window of interleaved data
+
+        Only the rows of interleaved data covered by the window are read from disk,
+        rather than reading the whole segment or an entire storage chunk.
+        The file position is assumed to be at the start of the segment's data.
+        """
+        self._check_same_chunk_length(data_objects)
+        total_data_width = sum(o.data_type.size for o in data_objects)
+        values_per_chunk = data_objects[0].number_values
+        num_rows = self._get_number_of_rows(data_objects)
+
+        window_start = window_index * window_size
+        window_end = min((window_index + 1) * window_size, num_rows)
+
+        log.debug(
+            "Reading interleaved window %d with rows %d to %d",
+            window_index, window_start, window_end)
+
+        (first_chunk, first_row_in_chunk,
+         last_chunk, last_row_in_chunk) = self._window_chunk_bounds(
+            window_start, window_end, values_per_chunk)
+
+        channel_data = {}
+        data_pos = 0
+        for obj in data_objects:
+            type_size = obj.data_type.size
+            byte_columns = tuple(range(data_pos, type_size + data_pos))
+            pieces = []
+            for chunk_index in range(first_chunk, last_chunk + 1):
+                row_start = first_row_in_chunk if chunk_index == first_chunk else 0
+                row_end = last_row_in_chunk if chunk_index == last_chunk else values_per_chunk
+                num_rows_in_piece = row_end - row_start
+                file.seek(self.data_position + self._row_byte_offset(
+                    chunk_index, row_start, values_per_chunk, total_data_width))
+                combined_data = read_interleaved_segment_bytes(
+                    file, total_data_width, num_rows_in_piece)
+                pieces.append(combined_data[:, byte_columns].ravel())
+            object_data = obj.data_type.from_bytes(np.concatenate(pieces), self.endianness)
+            channel_data[obj.path] = object_data
+            data_pos += type_size
+
+        return RawDataChunk.channel_data(channel_data)
+
+    def _read_channel_window(self, file, data_objects, channel_path, window_index, window_size):
+        """ Read a fixed size window of interleaved data for a single channel
+
+        The file position is assumed to be at the start of the segment's data.
+        """
+        self._check_same_chunk_length(data_objects)
+        channel_obj = next((o for o in data_objects if o.path == channel_path), None)
+        if channel_obj is None:
+            return RawChannelDataChunk.empty()
+
+        total_data_width = sum(o.data_type.size for o in data_objects)
+        values_per_chunk = data_objects[0].number_values
+        num_rows = self._get_number_of_rows(data_objects)
+
+        window_start = window_index * window_size
+        window_end = min((window_index + 1) * window_size, num_rows)
+
+        type_size = channel_obj.data_type.size
+        data_pos = 0
+        for obj in data_objects:
+            if obj.path == channel_path:
+                break
+            data_pos += obj.data_type.size
+        byte_columns = tuple(range(data_pos, type_size + data_pos))
+
+        (first_chunk, first_row_in_chunk,
+         last_chunk, last_row_in_chunk) = self._window_chunk_bounds(
+            window_start, window_end, values_per_chunk)
+
+        pieces = []
+        for chunk_index in range(first_chunk, last_chunk + 1):
+            row_start = first_row_in_chunk if chunk_index == first_chunk else 0
+            row_end = last_row_in_chunk if chunk_index == last_chunk else values_per_chunk
+            num_rows_in_piece = row_end - row_start
+            file.seek(self.data_position + self._row_byte_offset(
+                chunk_index, row_start, values_per_chunk, total_data_width))
+            combined_data = read_interleaved_segment_bytes(
+                file, total_data_width, num_rows_in_piece)
+            pieces.append(combined_data[:, byte_columns].ravel())
+
+        object_data = channel_obj.data_type.from_bytes(np.concatenate(pieces), self.endianness)
+        return RawChannelDataChunk.channel_data(object_data)
+
+    def _get_number_of_rows(self, data_objects):
+        """ Number of rows of interleaved data in the segment, accounting for a truncated final chunk
+        """
+        values_per_chunk = data_objects[0].number_values
+        if self.final_chunk_lengths_override is None:
+            return values_per_chunk * self.num_chunks
+        final_length = self.final_chunk_lengths_override.get(data_objects[0].path, 0)
+        return values_per_chunk * (self.num_chunks - 1) + final_length
+
+    @staticmethod
+    def _check_same_chunk_length(data_objects):
+        """ Interleaved data requires all channels to have the same number of values per chunk
+        """
+        if len(set(o.number_values for o in data_objects)) != 1:
+            raise ValueError("Cannot read interleaved data with different chunk sizes")
+
+    @staticmethod
+    def _window_chunk_bounds(window_start, window_end, values_per_chunk):
+        """ Work out which storage chunks and rows within them a window spans
+        """
+        first_chunk = window_start // values_per_chunk
+        last_chunk = (window_end - 1) // values_per_chunk
+        first_row_in_chunk = window_start - first_chunk * values_per_chunk
+        last_row_in_chunk = window_end - last_chunk * values_per_chunk
+        return first_chunk, first_row_in_chunk, last_chunk, last_row_in_chunk
+
+    @staticmethod
+    def _row_byte_offset(chunk_index, row_in_chunk, values_per_chunk, total_data_width):
+        """ Byte offset of a row relative to the start of the segment's raw data
+        """
+        return (chunk_index * values_per_chunk + row_in_chunk) * total_data_width
+
 
 class ContiguousDataReader(BaseDataReader):
     """ Reads data in a TDMS segment with contiguous (non-interleaved) data
@@ -536,11 +776,109 @@ class ContiguousDataReader(BaseDataReader):
 
         return channel_data
 
+    def _read_window(self, file, data_objects, window_index, window_size):
+        """ Read a fixed size window of contiguous data for all channels
+
+        The file position is assumed to be at the start of the segment's data.
+        Only the values covered by the window are read for each channel, rather
+        than reading an entire storage chunk.
+        """
+        object_data = {}
+        for obj in data_objects:
+            pieces = self._read_channel_value_range(file, obj, data_objects, window_index, window_size)
+            if pieces is not None:
+                object_data[obj.path] = pieces
+        return RawDataChunk.channel_data(object_data)
+
+    def _read_channel_window(self, file, data_objects, channel_path, window_index, window_size):
+        """ Read a fixed size window of contiguous data for a single channel
+        """
+        channel_obj = next((o for o in data_objects if o.path == channel_path), None)
+        if channel_obj is None:
+            return RawChannelDataChunk.empty()
+
+        pieces = self._read_channel_value_range(file, channel_obj, data_objects, window_index, window_size)
+        if pieces is None:
+            return RawChannelDataChunk.empty()
+        return RawChannelDataChunk.channel_data(pieces)
+
+    def _read_channel_value_range(self, file, obj, data_objects, window_index, window_size):
+        """ Read the values for one channel that fall within a window
+
+        Data is stored as a sequence of storage chunks, where each chunk contains
+        each channel's data contiguously. A window may span chunk boundaries, and
+        the final chunk may be truncated, so seek to each required position.
+        """
+        total_values = self._get_total_channel_values(obj)
+        window_start = min(window_index * window_size, total_values)
+        if window_start >= total_values:
+            return None
+        window_end = min((window_index + 1) * window_size, total_values)
+
+        first_chunk = window_start // obj.number_values
+        last_chunk = min((window_end - 1) // obj.number_values, self.num_chunks - 1)
+
+        pieces = []
+        for chunk_index in range(first_chunk, last_chunk + 1):
+            chunk_value_start = chunk_index * obj.number_values
+            values_in_chunk = self._get_channel_number_values(obj, chunk_index)
+            range_start = max(window_start, chunk_value_start)
+            range_end = min(window_end, chunk_value_start + values_in_chunk)
+            index_in_chunk = range_start - chunk_value_start
+            number_values = range_end - range_start
+            file.seek(self.data_position + self._get_value_byte_offset(
+                obj, data_objects, chunk_index, index_in_chunk))
+            pieces.append(obj.read_values(file, number_values, self.endianness))
+
+        if len(pieces) == 1:
+            return pieces[0]
+        # Preserve array subclasses such as TimestampArray when joining pieces
+        # that span multiple storage chunks.
+        joined = np.concatenate(pieces)
+        first_piece_type = type(pieces[0])
+        if isinstance(pieces[0], np.ndarray) and not isinstance(joined, first_piece_type):
+            joined = joined.view(first_piece_type)
+        return joined
+
+    def _get_total_channel_values(self, obj):
+        """ Total number of values a channel has in this segment
+        """
+        if self.final_chunk_lengths_override is None:
+            return obj.number_values * self.num_chunks
+        return (obj.number_values * (self.num_chunks - 1) +
+                self.final_chunk_lengths_override.get(obj.path, 0))
+
     def _get_channel_number_values(self, obj, chunk_index):
         if self.final_chunk_lengths_override is not None and chunk_index == (self.num_chunks - 1):
             return self.final_chunk_lengths_override.get(obj.path, 0)
         else:
             return obj.number_values
+
+    def _get_value_byte_offset(self, obj, data_objects, chunk_index, index_in_chunk):
+        """ Byte offset of a channel value relative to the start of the segment's raw data
+
+        Storage chunks are stored one after another, and within each chunk the
+        data for channels is stored contiguously in the order the objects appear.
+        The final chunk may be truncated so each channel may have fewer values.
+        """
+        # Skip over all complete storage chunks preceding this one
+        full_chunk_size = sum(other_obj.data_size for other_obj in data_objects)
+        offset = chunk_index * full_chunk_size
+        # Skip past preceding channels within the target chunk
+        for other_obj in data_objects:
+            if other_obj.path == obj.path:
+                break
+            values_in_chunk = self._get_channel_number_values(other_obj, chunk_index)
+            offset += values_in_chunk * other_obj.data_type.size
+        offset += index_in_chunk * obj.data_type.size
+        return offset
+
+    def _get_channel_value_offset(self, obj, value_index, data_objects):
+        """ Byte offset of a channel value relative to the start of the segment's raw data
+        """
+        chunk_index = value_index // obj.number_values
+        index_in_chunk = value_index % obj.number_values
+        return self._get_value_byte_offset(obj, data_objects, chunk_index, index_in_chunk)
 
 
 class TdmsSegmentObject(BaseSegmentObject):

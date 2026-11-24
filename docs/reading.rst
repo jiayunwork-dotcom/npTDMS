@@ -93,8 +93,11 @@ then channel data is read as required::
 
 TDMS files are written in multiple segments, where each segment can in turn have
 multiple chunks of data.
-When accessing a value or a slice of data in a channel, npTDMS will read whole chunks at a time.
-npTDMS also allows streaming data from a file chunk by chunk using
+When accessing a value or a slice of data in a channel, npTDMS reads only the
+fixed size windows of data needed to satisfy the request, rather than reading an
+entire storage chunk or segment. The amount of data read therefore depends on the
+number of values requested rather than how the file splits data into chunks.
+npTDMS also allows streaming data from a file window by window using
 :py:meth:`nptdms.TdmsFile.data_chunks`. This is a generator that produces instances of
 :py:class:`~nptdms.DataChunk`.
 For example, to compute the mean of a channel::

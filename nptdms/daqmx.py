@@ -18,6 +18,10 @@ DIGITAL_LINE_SCALER = 0x0000126A
 class DaqmxDataReader(BaseDataReader):
     """ A TDMS segment with DAQmx data
     """
+    def __init__(self, num_chunks, final_chunk_lengths_override, endianness, data_position=0):
+        super(DaqmxDataReader, self).__init__(
+            num_chunks, final_chunk_lengths_override, endianness, data_position)
+
     def _read_data_chunk(self, file, data_objects, chunk_index):
         """Read data from DAQmx data segment"""
 

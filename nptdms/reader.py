@@ -9,7 +9,7 @@ import struct
 
 from nptdms.common import toc_properties
 from nptdms.utils import Timer
-from nptdms.base_segment import RawChannelDataChunk
+from nptdms.base_segment import RawChannelDataChunk, DEFAULT_READ_WINDOW_SIZE
 from nptdms.tdms_segment import TdmsSegment, SegmentIndexCache
 from nptdms.log import log_manager
 
@@ -38,7 +38,7 @@ class TdmsReader(object):
         self._segments = None
         self._prev_segment_objects = {}
         self.object_metadata = OrderedDict()
-        self._segment_channel_offsets = {}
+        self._channel_indexes = {}
         self.tdms_version = None
 
         if hasattr(tdms_file, "read"):
@@ -139,6 +139,9 @@ class TdmsReader(object):
     def read_raw_data(self):
         """ Read raw data from all segments, chunk by chunk
 
+        Data is read in fixed size windows rather than entire storage chunks,
+        so memory usage is independent of how the file splits data into chunks.
+
         :returns: A generator that yields RawDataChunk objects
         """
         self._ensure_open()
@@ -147,11 +150,15 @@ class TdmsReader(object):
                 "Cannot read data unless metadata has first been read")
         for segment in self._segments:
             self._verify_segment_start(segment)
-            for chunk in segment.read_raw_data(self._file):
+            for chunk in segment.read_windows(self._file):
                 yield chunk
 
     def read_raw_data_for_channel(self, channel_path, offset=0, length=None):
         """ Read raw data for a single channel, chunk by chunk
+
+        Data is read in fixed size windows rather than entire storage chunks,
+        so the amount of data read is proportional to the number of requested
+        values, independent of how the file splits data into storage chunks.
 
         :param channel_path: The path of the channel object to read data for
         :param offset: Initial position to read data from.
@@ -164,15 +171,15 @@ class TdmsReader(object):
         if self._segments is None:
             raise RuntimeError("Cannot read data unless metadata has first been read")
 
-        try:
-            (first_segment, segment_offsets) = self._segment_channel_offsets[channel_path]
-        except KeyError:
-            with Timer(log, "Build data index for channel"):
-                self._build_index(channel_path)
-            (first_segment, segment_offsets) = self._segment_channel_offsets[channel_path]
+        index = self._get_channel_index(channel_path)
 
         object_metadata = self.object_metadata[channel_path]
+        if object_metadata.num_values == 0:
+            return
+
         max_length_from_offset = object_metadata.num_values - offset
+        if offset >= object_metadata.num_values:
+            return
         if length is None:
             length = max_length_from_offset
         else:
@@ -180,49 +187,45 @@ class TdmsReader(object):
             length = min(length, max_length_from_offset)
         end_index = offset + length
 
-        # Binary search to find first and last segments to read
-        start_segment = first_segment + np.searchsorted(segment_offsets, offset, side='right')
-        end_segment = first_segment + np.searchsorted(segment_offsets, end_index, side='left')
+        if length <= 0:
+            return
+
+        # Locate the first and last segments that contain values in [offset, end_index)
+        (first_segment, segment_offsets) = (index['first_segment'], index['segment_offsets'])
+        start_segment = first_segment + int(np.searchsorted(segment_offsets, offset, side='right'))
+        end_segment = first_segment + int(np.searchsorted(segment_offsets, end_index, side='left'))
 
         segment_index = start_segment
         values_read = 0
         for segment in self._segments[start_segment:end_segment + 1]:
             self._verify_segment_start(segment)
-            # By default, read all chunks in a segment
-            chunk_offset = 0
-            num_chunks = segment.num_chunks
-            segment_obj = segment.get_segment_object(channel_path)
-            chunk_size = 0 if (segment_obj is None or not segment_obj.has_data) else segment_obj.number_values
-            if chunk_size == 0:
-                continue
             segment_start_index = (
-                0 if segment_index == first_segment else segment_offsets[segment_index - first_segment - 1])
-            remaining_values_to_skip = 0
+                0 if segment_index == first_segment
+                else int(segment_offsets[segment_index - first_segment - 1]))
+            segment_end_index = int(segment_offsets[segment_index - first_segment])
 
-            # For the first and last segments, we may not need to read all chunks,
-            # and may need to trim some data from the beginning or end of the chunk.
-            if segment_index == start_segment:
-                num_values_to_skip = offset - segment_start_index
-                chunk_offset = num_values_to_skip // chunk_size
-                remaining_values_to_skip = num_values_to_skip % chunk_size
-                num_chunks -= chunk_offset
-            if segment_index == end_segment:
-                # Note: segment_index may be both start and end
-                segment_end_index = segment_offsets[segment_index - first_segment]
-                num_values_to_trim = segment_end_index - end_index
+            # The range of values to read from this segment
+            read_start = max(offset, segment_start_index) - segment_start_index
+            read_end = min(end_index, segment_end_index) - segment_start_index
 
-                # Account for segments where the final chunk is truncated
-                final_chunk_size = (segment_end_index - segment_start_index) % chunk_size
-                final_chunk_size = chunk_size if final_chunk_size == 0 else final_chunk_size
-                if num_values_to_trim >= final_chunk_size:
-                    num_chunks -= 1
-                    num_values_to_trim -= final_chunk_size
+            if segment.supports_windowed_reading:
+                window_offset = read_start // DEFAULT_READ_WINDOW_SIZE
+                stop_window = (read_end + DEFAULT_READ_WINDOW_SIZE - 1) // DEFAULT_READ_WINDOW_SIZE
+                first_window_trim = read_start - window_offset * DEFAULT_READ_WINDOW_SIZE
+            else:
+                # DAQmx and string segments are still read one storage chunk at a time
+                segment_obj = segment.get_segment_object(channel_path)
+                chunk_size = segment_obj.number_values if (segment_obj is not None and segment_obj.has_data) else 0
+                if chunk_size == 0:
+                    segment_index += 1
+                    continue
+                window_offset = read_start // chunk_size
+                stop_window = (read_end + chunk_size - 1) // chunk_size
+                first_window_trim = read_start - window_offset * chunk_size
 
-                num_chunks -= num_values_to_trim // chunk_size
-
-            for i, chunk in enumerate(
-                    segment.read_raw_data_for_channel(self._file, channel_path, chunk_offset, num_chunks)):
-                skip = remaining_values_to_skip if i == 0 else 0
+            for i, chunk in enumerate(segment.read_channel_windows(
+                    self._file, channel_path, window_offset, stop_window)):
+                skip = first_window_trim if i == 0 else 0
                 values_read += len(chunk) - skip
                 trim = 0 if values_read < length else values_read - length
                 yield _trim_channel_chunk(chunk, skip, trim)
@@ -230,7 +233,7 @@ class TdmsReader(object):
             segment_index += 1
 
     def read_channel_chunk_for_index(self, channel_path, index):
-        """ Read the chunk containing the given index
+        """ Read the window containing the given index
 
         :returns: Tuple of raw channel data chunk and the integer offset to the beginning of the chunk
         :rtype: (RawChannelDataChunk, int)
@@ -239,27 +242,36 @@ class TdmsReader(object):
         if self._segments is None:
             raise RuntimeError("Cannot read data unless metadata has first been read")
 
-        try:
-            (first_segment, segment_offsets) = self._segment_channel_offsets[channel_path]
-        except KeyError:
-            with Timer(log, "Build data index for channel"):
-                self._build_index(channel_path)
-            (first_segment, segment_offsets) = self._segment_channel_offsets[channel_path]
+        channel_index = self._get_channel_index(channel_path)
+        if self.object_metadata[channel_path].num_values == 0:
+            raise IndexError("Cannot read data for a channel with no data")
+        (first_segment, segment_offsets) = (
+            channel_index['first_segment'], channel_index['segment_offsets'])
 
         # Binary search to find the segment to read
-        segment_index = first_segment + np.searchsorted(segment_offsets, index, side='right')
+        segment_index = first_segment + int(np.searchsorted(segment_offsets, index, side='right'))
         segment = self._segments[segment_index]
-        segment_obj = segment.get_segment_object(channel_path)
-        chunk_size = 0 if segment_obj is None else segment_obj.number_values
         segment_start_index = (
-            0 if segment_index == first_segment else segment_offsets[segment_index - first_segment - 1])
-
+            0 if segment_index == first_segment
+            else int(segment_offsets[segment_index - first_segment - 1]))
         index_in_segment = index - segment_start_index
-        chunk_index = index_in_segment // chunk_size
 
         self._verify_segment_start(segment)
-        chunk_data = next(segment.read_raw_data_for_channel(self._file, channel_path, chunk_index, 1))
-        chunk_offset = segment_start_index + chunk_index * chunk_size
+
+        if segment.supports_windowed_reading:
+            window_index = index_in_segment // DEFAULT_READ_WINDOW_SIZE
+            chunk_data = next(segment.read_channel_windows(
+                self._file, channel_path, window_index, window_index + 1))
+            chunk_offset = segment_start_index + window_index * DEFAULT_READ_WINDOW_SIZE
+        else:
+            # DAQmx and string segments still use storage chunks
+            segment_obj = segment.get_segment_object(channel_path)
+            chunk_size = segment_obj.number_values
+            chunk_index = index_in_segment // chunk_size
+            chunk_data = next(segment.read_raw_data_for_channel(
+                self._file, channel_path, chunk_index, 1))
+            chunk_offset = segment_start_index + chunk_index * chunk_size
+
         return chunk_data, chunk_offset
 
     def is_index_file_only(self):
@@ -393,10 +405,21 @@ class TdmsReader(object):
             self.object_metadata[path] = obj
             return obj
 
+    def _get_channel_index(self, channel_path):
+        """ Get or build the index used to locate a channel's data across segments
+        """
+        try:
+            return self._channel_indexes[channel_path]
+        except KeyError:
+            with Timer(log, "Build data index for channel"):
+                self._build_index(channel_path)
+            return self._channel_indexes[channel_path]
+
     def _build_index(self, channel_path):
         """ Builds an index into the segment data for faster lookup of values
 
-            _segment_channel_offsets provides data offset at the end of each segment per channel
+        The index contains the cumulative number of values at the end of each
+        segment for the channel, used to map a value to a segment and a window.
         """
         num_segments = len(self._segments)
 
@@ -419,15 +442,23 @@ class TdmsReader(object):
         # Now use the cumulative sum to get the total channel value count
         # at the end of each segment.
         if first_segment == -1:
-            first_segment = num_segments
-            last_segment = num_segments
+            # This channel doesn't have any data in any segment
+            self._channel_indexes[channel_path] = {
+                'first_segment': num_segments,
+                'segment_offsets': np.empty(0, dtype=np.int64),
+            }
+            return
         channel_offsets = np.cumsum(segment_num_values[first_segment:last_segment + 1])
 
         # It's likely that many channels will have the same shaped data,
         # so de-duplicate these arrays to reduce memory usage.
-        existing_arrays = (xs for (_, xs) in self._segment_channel_offsets.values())
+        existing_arrays = (idx['segment_offsets'] for idx in self._channel_indexes.values())
         channel_offsets = _deduplicate_array(channel_offsets, existing_arrays)
-        self._segment_channel_offsets[channel_path] = (first_segment, channel_offsets)
+
+        self._channel_indexes[channel_path] = {
+            'first_segment': first_segment,
+            'segment_offsets': channel_offsets,
+        }
 
     def _ensure_open(self):
         if self._file is None and self._index_file is None:
